@@ -439,7 +439,7 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	// Inject simulated tool prompt if tool calling is enabled.
 	// The entire request JSON is sent as the prompt; M365 returns a full
 	// chat.completion response in a ```json block.
-	if api.config.ToolCalling && len(req.Tools) > 0 {
+	if len(req.Tools) > 0 {
 		injectSimulatedPrompt(&req.Messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
 	}
 
@@ -468,7 +468,7 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	api.uploadImagesAndAnnotate(&req.Messages, convID)
 
 	// Determine if client-defined tools are present (for optionsSets stripping)
-	hasTools := api.config.ToolCalling && len(req.Tools) > 0
+	hasTools := len(req.Tools) > 0
 
 	if req.Stream {
 		api.streamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools)
@@ -578,7 +578,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	// Inject simulated tool prompt if tool calling is enabled.
 	// The entire Anthropic request JSON is sent as the prompt; M365 returns
 	// a full Anthropic Messages response in a ```json block.
-	if api.config.ToolCalling && len(req.Tools) > 0 {
+	if len(req.Tools) > 0 {
 		injectSimulatedPromptAnthropic(&chatMessages, string(bodyBytes), anthropicToolChoiceString(req.ToolChoice))
 	}
 
@@ -596,7 +596,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	api.uploadImagesAndAnnotate(&chatMessages, convID)
 
 	// Determine if client-defined tools are present (for optionsSets stripping)
-	hasTools := api.config.ToolCalling && len(req.Tools) > 0
+	hasTools := len(req.Tools) > 0
 
 	if req.Stream {
 		api.streamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools)
@@ -712,7 +712,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// parse for tool calls at the end. Tool call blocks may span multiple
 	// chunks, so we can't parse incrementally. When no tools are present, stream
 	// text directly regardless of the global ToolCalling flag.
-	toolCallingEnabled := api.config.ToolCalling && hasTools
+	toolCallingEnabled := hasTools
 
 	for chunk := range ch {
 		if chunk.Error != nil {
@@ -809,7 +809,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
 	// simulated JSON response are valid.
-	if api.config.ToolCalling {
+	if hasTools {
 		toolCalls = nil
 	}
 
@@ -888,12 +888,12 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
 	// simulated JSON response are valid.
-	if api.config.ToolCalling {
+	if hasTools {
 		toolCalls = nil
 	}
 
 	// Parse simulated tool calls from response text if tool calling is enabled
-	if api.config.ToolCalling {
+	if hasTools {
 		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
@@ -1031,7 +1031,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	thinkingBlockOpen := false
 	textBlockOpen := false
 	blockIndex := 0
-	toolCallingEnabled := api.config.ToolCalling && hasTools
+	toolCallingEnabled := hasTools
 	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 
 	for chunk := range ch {
@@ -1164,7 +1164,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
 	// simulated JSON response are valid.
-	if api.config.ToolCalling {
+	if hasTools {
 		toolCalls = nil
 	}
 
@@ -1247,12 +1247,12 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
 	// simulated JSON response are valid.
-	if api.config.ToolCalling {
+	if hasTools {
 		toolCalls = nil
 	}
 
 	// Parse simulated tool calls from response text if tool calling is enabled
-	if api.config.ToolCalling {
+	if hasTools {
 		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {

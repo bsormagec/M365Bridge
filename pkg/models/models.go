@@ -70,7 +70,6 @@ type Config struct {
 	ClientID        string
 	Scope           string
 	APIKeys         []string
-	ToolCalling     bool
 }
 
 // LoadConfig loads configuration from .env file and environment variables.
@@ -85,7 +84,6 @@ func LoadConfig() *Config {
 		ClientID:        getEnvWithDefault("M365_CLIENT_ID", DefaultClientID),
 		Scope:           DefaultScope,
 		APIKeys:         parseAPIKeys(os.Getenv("M365_API_KEYS"), os.Getenv("M365_API_KEY")),
-		ToolCalling:     getEnvBool("M365_TOOL_CALLING", true),
 	}
 }
 
