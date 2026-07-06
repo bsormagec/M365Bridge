@@ -437,15 +437,19 @@ print(resp.choices[0].message.content)
 
 ## Models
 
-All model selection is via the `tone` field sent to the M365 backend. The `Override` field is empty for all models. All model identifiers route to the same GPT-5 backend; the `tone` field controls response behavior.
+All model selection is via the `tone` field sent to the M365 backend. The `Override` field is empty for all models. GPT-5.x models route to the GPT-5 backend; Claude models route to real Anthropic Claude models (verified via tone test).
 
-| Key                | Tone              | OpenAI ID         | Thinking? |
-|--------------------|-------------------|-------------------|-----------|
-| `auto`             | Magic             | gpt-4-auto        | No        |
-| `quick`            | Chat              | gpt-4-quick       | No        |
-| `reasoning`        | Magic             | gpt-4-reasoning   | No        |
-| `gpt5.5`           | Gpt_5_5_Chat      | gpt-5.5           | No        |
-| `gpt5.5-reasoning` | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Yes       |
+| Key                | Tone              | OpenAI ID           | Thinking? | Backend |
+|--------------------|-------------------|---------------------|-----------|---------|
+| `auto`             | Magic             | gpt-4-auto          | No        | GPT-5   |
+| `quick`            | Chat              | gpt-4-quick         | No        | GPT-5   |
+| `reasoning`        | Magic             | gpt-4-reasoning     | No        | GPT-5   |
+| `gpt5.5`           | Gpt_5_5_Chat      | gpt-5.5             | No        | GPT-5   |
+| `gpt5.5-reasoning` | Gpt_5_5_Reasoning | gpt-5.5-reasoning   | Yes       | GPT-5   |
+| `claude`           | Claude_Sonnet     | claude-sonnet-4.6   | No        | Claude  |
+| `claude-sonnet`    | Claude_Sonnet     | claude-sonnet-4.6   | No        | Claude  |
+| `claude-opus`      | Claude_Opus       | claude-opus-4.6     | No        | Claude  |
+| `claude-sonnet-4-20250514` | Claude_Sonnet | claude-sonnet-4.6 | No      | Claude  |
 
 ### Which model should I use?
 
@@ -456,8 +460,10 @@ All model selection is via the `tone` field sent to the M365 backend. The `Overr
 | Complex reasoning, multi-step problems       | `reasoning`        |
 | GPT-5.5 chat (latest conversational model)   | `gpt5.5`           |
 | GPT-5.5 with deep thinking (shows reasoning) | `gpt5.5-reasoning` |
+| Claude Sonnet 4.6 (Anthropic)                | `claude-sonnet`    |
+| Claude Opus 4.6 (Anthropic, most capable)    | `claude-opus`      |
 
-`gpt5.5-reasoning` produces `reasoning_content` output containing the model's thinking process. OpenAI endpoints expose this as `reasoning_content`; Anthropic endpoints expose it as a `thinking` content block before the `text` block.
+`gpt5.5-reasoning` produces `reasoning_content` output containing the model's thinking process. OpenAI endpoints expose this as `reasoning_content`; Anthropic endpoints expose it as a `thinking` content block before the `text` block. Claude models do not produce reasoning content.
 
 ### Session ID in Model Name
 

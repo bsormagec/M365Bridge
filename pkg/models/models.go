@@ -53,6 +53,27 @@ var ModelRegistry = map[string]ModelConfig{
 		Override: "",
 		OpenAIID: "gpt-5.5-reasoning",
 	},
+	// Claude — real Anthropic models (verified via tone test, July 2026)
+	"claude": {
+		Tone:     "Claude_Sonnet",
+		Override: "",
+		OpenAIID: "claude-sonnet-4.6",
+	},
+	"claude-sonnet": {
+		Tone:     "Claude_Sonnet",
+		Override: "",
+		OpenAIID: "claude-sonnet-4.6",
+	},
+	"claude-opus": {
+		Tone:     "Claude_Opus",
+		Override: "",
+		OpenAIID: "claude-opus-4.6",
+	},
+	"claude-sonnet-4-20250514": {
+		Tone:     "Claude_Sonnet",
+		Override: "",
+		OpenAIID: "claude-sonnet-4.6",
+	},
 }
 
 // ToolMessageType maps WebSocket message types to tool function names.
