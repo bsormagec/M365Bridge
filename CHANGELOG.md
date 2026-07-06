@@ -5,6 +5,22 @@ All notable changes to M365Bridge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-06
+
+### Added
+- Simulated tool calling mode for client-defined tools (OpenAI and Anthropic endpoints, streaming and non-streaming)
+- Native Anthropic simulated mode with dedicated SSE handlers (`BuildSimulatedPromptAnthropic`/`ParseSimulatedResponseAnthropic`)
+- Shell-routing for agentic coding loops (Claude Code, Droid CLI, Codex)
+- Claude model support: `claude`, `claude-sonnet`, `claude-opus`, `claude-sonnet-4-20250514` (verified via tone test, routes to real Anthropic Claude Sonnet/Opus 4.6)
+- Session ID embedded in model name via `:` separator (e.g. `gpt5.5-reasoning:my-session-001`)
+
+### Changed
+- Removed global `ToolCalling` configuration (`M365_TOOL_CALLING` env var and `Config.ToolCalling` field); tool calling is always enabled, `len(req.Tools) > 0` is the only gate
+- Removed tool calling mode configuration (`M365_TOOL_CALLING_MODE` env var and `Config.ToolCallingMode` field); simulated mode is the only mode
+- Removed fenced code block tool calling mode and all related functions (`ParseToolCalls`, `buildToolInstruction`, `injectToolDefs`, anti-confabulation retry logic)
+- Strengthened and clarified tool use system instructions
+- Updated documentation for tool calling and session isolation
+
 ## [1.0.3] - 2026-07-05
 
 ### Added
