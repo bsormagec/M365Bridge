@@ -436,14 +436,11 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Inject tool definitions into last user message if tool calling is enabled.
-	// In simulated mode, the entire request JSON is sent as the prompt instead.
+	// Inject simulated tool prompt if tool calling is enabled.
+	// The entire request JSON is sent as the prompt; M365 returns a full
+	// chat.completion response in a ```json block.
 	if api.config.ToolCalling && len(req.Tools) > 0 {
-		if api.config.ToolCallingMode == "simulated" {
-			injectSimulatedPrompt(&req.Messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
-		} else {
-			injectToolDefs(&req.Messages, req.Tools)
-		}
+		injectSimulatedPrompt(&req.Messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
 	}
 
 	// Resolve session ID and conversation ID
@@ -578,15 +575,11 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 	chatMessages = append(chatMessages, req.Messages...)
 
-	// Inject tool definitions into last user message if tool calling is enabled.
-	// In simulated mode, the entire Anthropic request JSON is sent as the prompt
-	// instead (Anthropic-native — no OpenAI conversion).
+	// Inject simulated tool prompt if tool calling is enabled.
+	// The entire Anthropic request JSON is sent as the prompt; M365 returns
+	// a full Anthropic Messages response in a ```json block.
 	if api.config.ToolCalling && len(req.Tools) > 0 {
-		if api.config.ToolCallingMode == "simulated" {
-			injectSimulatedPromptAnthropic(&chatMessages, string(bodyBytes), anthropicToolChoiceString(req.ToolChoice))
-		} else {
-			injectToolDefs(&chatMessages, req.Tools)
-		}
+		injectSimulatedPromptAnthropic(&chatMessages, string(bodyBytes), anthropicToolChoiceString(req.ToolChoice))
 	}
 
 	// Resolve session ID and conversation ID
@@ -780,21 +773,13 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		if api.config.ToolCallingMode == "simulated" {
-			sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
-			if sim.HasPayload {
-				if len(sim.ToolCalls) > 0 {
-					simToolCalls = sim.ToolCalls
-					fullText = ""
-				} else {
-					fullText = sim.Content
-				}
-			}
-		} else {
-			cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText, tools)
-			if len(parsedCalls) > 0 {
-				fullText = cleanedText
-				simToolCalls = parsedCalls
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			if len(sim.ToolCalls) > 0 {
+				simToolCalls = sim.ToolCalls
+				fullText = ""
+			} else {
+				fullText = sim.Content
 			}
 		}
 	}
@@ -824,7 +809,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
 	// simulated JSON response are valid.
-	if api.config.ToolCalling && api.config.ToolCallingMode == "simulated" {
+	if api.config.ToolCalling {
 		toolCalls = nil
 	}
 
@@ -903,74 +888,34 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
 	// simulated JSON response are valid.
-	if api.config.ToolCalling && api.config.ToolCallingMode == "simulated" {
+	if api.config.ToolCalling {
 		toolCalls = nil
 	}
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if api.config.ToolCalling {
-		if api.config.ToolCallingMode == "simulated" {
-			sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
-			if sim.HasPayload {
-				if len(sim.ToolCalls) > 0 {
-					finishReason = "tool_calls"
-					for _, pc := range sim.ToolCalls {
-						toolCalls = append(toolCalls, client.ToolCall{
-							ID:       pc.ID,
-							Type:     "function",
-							Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
-						})
-					}
-					respText = ""
-				} else {
-					respText = sim.Content
-					finishReason = "stop"
-				}
-			} else {
-				// M365 did not return a simulated JSON payload (e.g. it ran
-				// its own server-side tools and returned plain text). Since
-				// we discarded backend-injected toolCalls above, reset the
-				// finish reason so we don't report tool_use with no blocks.
-				finishReason = "stop"
-			}
-		} else {
-			cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText, tools)
-			if len(parsedCalls) > 0 {
-				respText = cleanedText
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
-				for _, pc := range parsedCalls {
+				for _, pc := range sim.ToolCalls {
 					toolCalls = append(toolCalls, client.ToolCall{
 						ID:       pc.ID,
 						Type:     "function",
 						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
 					})
 				}
-			} else if hasTools && toolcalling.LooksLikeConfabulation(respText) {
-				// Anti-confabulation retry: model claimed it can't access files without
-				// calling a tool. Force a retry in the same conversation.
-				retryMsg := []payload.Message{
-					{Role: "user", Content: "You have not used any tool. Do not claim you cannot access files or that files are empty. Emit a single ```bash block now to inspect the files and run commands. Act, do not explain."},
-				}
-				retryText, _, retryToolCalls, retryFinish, retryErr := api.m365Client.ChatConversation(retryMsg, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-				if retryErr == nil {
-					retryCleaned, retryParsed := toolcalling.ParseToolCalls(retryText, tools)
-					if len(retryParsed) > 0 {
-						respText = retryCleaned
-						finishReason = "tool_calls"
-						for _, pc := range retryParsed {
-							toolCalls = append(toolCalls, client.ToolCall{
-								ID:       pc.ID,
-								Type:     "function",
-								Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
-							})
-						}
-					} else {
-						respText = retryText
-						finishReason = retryFinish
-						toolCalls = retryToolCalls
-					}
-				}
+				respText = ""
+			} else {
+				respText = sim.Content
+				finishReason = "stop"
 			}
+		} else {
+			// M365 did not return a simulated JSON payload (e.g. it ran
+			// its own server-side tools and returned plain text). Since
+			// we discarded backend-injected toolCalls above, reset the
+			// finish reason so we don't report tool_use with no blocks.
+			finishReason = "stop"
 		}
 	}
 
@@ -1172,21 +1117,13 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		if api.config.ToolCallingMode == "simulated" {
-			sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools))
-			if sim.HasPayload {
-				if len(sim.ToolCalls) > 0 {
-					simToolCalls = sim.ToolCalls
-					fullText = ""
-				} else {
-					fullText = sim.Content
-				}
-			}
-		} else {
-			cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText, tools)
-			if len(parsedCalls) > 0 {
-				fullText = cleanedText
-				simToolCalls = parsedCalls
+		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			if len(sim.ToolCalls) > 0 {
+				simToolCalls = sim.ToolCalls
+				fullText = ""
+			} else {
+				fullText = sim.Content
 			}
 		}
 	}
@@ -1227,7 +1164,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
 	// simulated JSON response are valid.
-	if api.config.ToolCalling && api.config.ToolCallingMode == "simulated" {
+	if api.config.ToolCalling {
 		toolCalls = nil
 	}
 
@@ -1310,74 +1247,34 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
 	// simulated JSON response are valid.
-	if api.config.ToolCalling && api.config.ToolCallingMode == "simulated" {
+	if api.config.ToolCalling {
 		toolCalls = nil
 	}
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if api.config.ToolCalling {
-		if api.config.ToolCallingMode == "simulated" {
-			sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools))
-			if sim.HasPayload {
-				if len(sim.ToolCalls) > 0 {
-					finishReason = "tool_calls"
-					for _, pc := range sim.ToolCalls {
-						toolCalls = append(toolCalls, client.ToolCall{
-							ID:       pc.ID,
-							Type:     "function",
-							Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
-						})
-					}
-					respText = ""
-				} else {
-					respText = sim.Content
-					finishReason = "stop"
-				}
-			} else {
-				// M365 did not return a simulated JSON payload (e.g. it ran
-				// its own server-side tools and returned plain text). Since
-				// we discarded backend-injected toolCalls above, reset the
-				// finish reason so we don't report tool_use with no blocks.
-				finishReason = "stop"
-			}
-		} else {
-			cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText, tools)
-			if len(parsedCalls) > 0 {
-				respText = cleanedText
+		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
-				for _, pc := range parsedCalls {
+				for _, pc := range sim.ToolCalls {
 					toolCalls = append(toolCalls, client.ToolCall{
 						ID:       pc.ID,
 						Type:     "function",
 						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
 					})
 				}
-			} else if hasTools && toolcalling.LooksLikeConfabulation(respText) {
-				// Anti-confabulation retry: model claimed it can't access files without
-				// calling a tool. Force a retry in the same conversation.
-				retryMsg := []payload.Message{
-					{Role: "user", Content: "You have not used any tool. Do not claim you cannot access files or that files are empty. Emit a single ```bash block now to inspect the files and run commands. Act, do not explain."},
-				}
-				retryText, _, retryToolCalls, retryFinish, retryErr := api.m365Client.ChatConversation(retryMsg, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-				if retryErr == nil {
-					retryCleaned, retryParsed := toolcalling.ParseToolCalls(retryText, tools)
-					if len(retryParsed) > 0 {
-						respText = retryCleaned
-						finishReason = "tool_calls"
-						for _, pc := range retryParsed {
-							toolCalls = append(toolCalls, client.ToolCall{
-								ID:       pc.ID,
-								Type:     "function",
-								Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
-							})
-						}
-					} else {
-						respText = retryText
-						finishReason = retryFinish
-						toolCalls = retryToolCalls
-					}
-				}
+				respText = ""
+			} else {
+				respText = sim.Content
+				finishReason = "stop"
 			}
+		} else {
+			// M365 did not return a simulated JSON payload (e.g. it ran
+			// its own server-side tools and returned plain text). Since
+			// we discarded backend-injected toolCalls above, reset the
+			// finish reason so we don't report tool_use with no blocks.
+			finishReason = "stop"
 		}
 	}
 
@@ -1767,27 +1664,6 @@ func (api *APIServer) injectJSONMode(messages *[]payload.Message) {
 	}
 
 	*messages = append([]payload.Message{{Role: "system", Content: instruction}}, *messages...)
-}
-
-// injectToolDefs prepends tool definitions and instructions to the last user message.
-func injectToolDefs(messages *[]payload.Message, tools []toolcalling.ToolDef) {
-	if len(tools) == 0 || len(*messages) == 0 {
-		return
-	}
-
-	// Build tool instruction text
-	msgTexts := make([]string, len(*messages))
-	for i, msg := range *messages {
-		msgTexts[i] = msg.Content
-	}
-	injected := toolcalling.InjectTools(msgTexts, tools)
-
-	for i := len(*messages) - 1; i >= 0; i-- {
-		if (*messages)[i].Role == "user" {
-			(*messages)[i].Content = injected[i]
-			break
-		}
-	}
 }
 
 // injectSimulatedPrompt replaces the last user message with a simulated-mode

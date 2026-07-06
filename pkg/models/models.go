@@ -71,7 +71,6 @@ type Config struct {
 	Scope           string
 	APIKeys         []string
 	ToolCalling     bool
-	ToolCallingMode string // "fenced" (default) or "simulated" (edlaver-style)
 }
 
 // LoadConfig loads configuration from .env file and environment variables.
@@ -80,11 +79,6 @@ func LoadConfig() *Config {
 	// Load .env file if it exists
 	loadDotEnv()
 
-	mode := getEnvWithDefault("M365_TOOL_CALLING_MODE", "fenced")
-	if mode != "fenced" && mode != "simulated" {
-		mode = "fenced"
-	}
-
 	return &Config{
 		TenantID:        os.Getenv("M365_TENANT_ID"),
 		UserOID:         os.Getenv("M365_USER_OID"),
@@ -92,7 +86,6 @@ func LoadConfig() *Config {
 		Scope:           DefaultScope,
 		APIKeys:         parseAPIKeys(os.Getenv("M365_API_KEYS"), os.Getenv("M365_API_KEY")),
 		ToolCalling:     getEnvBool("M365_TOOL_CALLING", true),
-		ToolCallingMode: mode,
 	}
 }
 
