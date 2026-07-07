@@ -154,6 +154,7 @@ func (api *APIServer) Start(port int) error {
 	mux.HandleFunc("/v1/chat/completions", api.withAuth(api.handleChatCompletions))
 	mux.HandleFunc("/v1/completions", api.withAuth(api.handleCompletions))
 	mux.HandleFunc("/v1/responses", api.withAuth(api.handleResponses))
+	mux.HandleFunc("/v1/responses/compact", api.withAuth(api.handleResponsesCompact))
 	mux.HandleFunc("/v1/messages", api.withAuth(api.handleAnthropicMessages))
 	mux.HandleFunc("/v1/complete", api.withAuth(api.handleAnthropicComplete))
 	mux.HandleFunc("/v1/images/generations", api.withAuth(api.handleImageGenerations))
@@ -2609,6 +2610,306 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 
 	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, thinkingText, toolCalls, finishReason, promptTok, completionTok, reasoningTok)
 	finalResponse["status"] = status
+
+	sendEvent("response.completed", map[string]interface{}{
+		"response": finalResponse,
+	})
+
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+
+	// Cache conversation ID for session continuity
+	if sid != "" {
+		if convID := api.m365Client.LastConversationID(); convID != "" {
+			api.ctxCache.Set("session:"+sid, convID)
+		}
+	}
+}
+
+// ===================================================================
+// OpenAI Responses Compact API (/v1/responses/compact)
+// ===================================================================
+
+// defaultCompactionPrompt is the system instruction sent to M365 Copilot when
+// compacting a conversation. It asks the model to produce a concise summary
+// that preserves key context for continuation.
+const defaultCompactionPrompt = "I need a concise summary of the following conversation between a user and an assistant. Please cover the main topics discussed, any decisions made, code or files mentioned, and what was being worked on. Keep it brief but preserve all important context."
+
+// handleResponsesCompact handles POST /v1/responses/compact requests from Codex.
+// It sends the conversation history to M365 Copilot with a compaction prompt,
+// then returns the summary wrapped in a compaction output item.
+func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		api.handleCORS(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read request body: %v", err))
+		return
+	}
+	r.Body.Close()
+
+	var req responsesRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return
+	}
+
+	// Parse model (may contain session ID suffix)
+	modelKey, modelSessionID := parseModelSessionID(req.Model)
+	cfg := models.LookupModel(modelKey)
+	if cfg.OpenAIID == "" {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
+		return
+	}
+
+	// Convert Responses API input to payload.Message list
+	inputMessages := responsesInputToMessages(req.Input)
+
+	// Flatten the conversation history into a single user message with
+	// compaction instructions. M365 has no system role and responds to the
+	// last user message, so we must merge everything into one message to
+	// prevent the model from answering the conversation instead of summarizing it.
+	compactionInstr := defaultCompactionPrompt
+	instructions := strings.TrimSpace(req.Instructions)
+	if instructions != "" {
+		compactionInstr = instructions
+	}
+
+	var conversationText strings.Builder
+	conversationText.WriteString(compactionInstr)
+	conversationText.WriteString("\n\n")
+	for _, m := range inputMessages {
+		conversationText.WriteString(fmt.Sprintf("%s: %s\n", m.Role, m.Content))
+	}
+	conversationText.WriteString("\nPlease provide the summary now.")
+
+	messages := []payload.Message{
+		{Role: "user", Content: conversationText.String()},
+	}
+
+	// Resolve session ID (same priority as handleResponses)
+	sid := modelSessionID
+	if sid == "" {
+		sid = req.PreviousResponseID
+	}
+	if sid == "" {
+		sid = req.SessionID
+	}
+	if sid == "" {
+		sid = req.User
+	}
+	if sid == "" {
+		sid = r.Header.Get("X-Session-Id")
+	}
+	if sid == "" {
+		sid = api.hashSessionIDFromMessages(r, messages)
+	}
+
+	var convID string
+	if sid != "" {
+		convID = api.ctxCache.Get("session:" + sid)
+	}
+
+	// Upload any images found in multimodal content
+	api.uploadImagesAndAnnotate(&messages, convID)
+
+	hasTools := len(req.Tools) > 0
+
+	logging.Infof("handleResponsesCompact: model=%s sid=%s convID=%s stream=%t tools=%d", modelKey, sid, convID, req.Stream, len(req.Tools))
+
+	if req.Stream {
+		api.streamResponsesCompact(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+	} else {
+		api.nonStreamResponsesCompact(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+	}
+}
+
+// buildCompactionResponseObject constructs the non-streaming compact response.
+// The output contains exactly one compaction item with encrypted_content set
+// to the M365 summary text.
+func buildCompactionResponseObject(responseID, model, summaryText string, promptTok, completionTok int) map[string]interface{} {
+	compactionID := fmt.Sprintf("cmp_%s", responseID)
+	output := []map[string]interface{}{
+		{
+			"id":                compactionID,
+			"type":              "compaction",
+			"encrypted_content": summaryText,
+		},
+	}
+
+	return map[string]interface{}{
+		"id":         responseID,
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"status":     "completed",
+		"model":      model,
+		"output":     output,
+		"usage": map[string]interface{}{
+			"input_tokens":  promptTok,
+			"output_tokens": completionTok,
+			"total_tokens":  promptTok + completionTok,
+		},
+	}
+}
+
+// nonStreamResponsesCompact handles non-streaming compact requests.
+func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
+	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	if err != nil {
+		logging.Errorf("nonStreamResponsesCompact: chat failed: %v", err)
+		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Compaction failed: %v", err))
+		return
+	}
+
+	// In simulated mode, extract plain content
+	if hasTools {
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			respText = sim.Content
+		}
+	}
+
+	// Enforce max_output_tokens
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
+			respText = truncated
+		}
+	}
+
+	promptStr := fmt.Sprint(messages)
+	promptTok := countTokens(promptStr)
+	completionTok := countTokens(respText)
+
+	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
+	response := buildCompactionResponseObject(responseID, cfg.OpenAIID, respText, promptTok, completionTok)
+
+	api.sendJSON(w, http.StatusOK, response)
+
+	// Cache conversation ID for session continuity
+	if sid != "" {
+		if convID := api.m365Client.LastConversationID(); convID != "" {
+			api.ctxCache.Set("session:"+sid, convID)
+		}
+	}
+}
+
+// streamResponsesCompact handles streaming compact requests.
+// It emits a standard Responses SSE stream but replaces the output item
+// with a single compaction item containing the summary.
+func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
+		return
+	}
+
+	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
+	openaiModel := cfg.OpenAIID
+	compactionID := fmt.Sprintf("cmp_%s", responseID)
+
+	sendEvent := func(eventType string, data map[string]interface{}) {
+		data["type"] = eventType
+		jsonData, _ := json.Marshal(data)
+		fmt.Fprintf(w, "data: %s\n\n", jsonData)
+		flusher.Flush()
+	}
+
+	// Send response.created event
+	sendEvent("response.created", map[string]interface{}{
+		"response": map[string]interface{}{
+			"id":     responseID,
+			"object": "response",
+			"status": "in_progress",
+			"model":  openaiModel,
+		},
+	})
+
+	// Send response.in_progress event
+	sendEvent("response.in_progress", map[string]interface{}{
+		"response": map[string]interface{}{
+			"id":     responseID,
+			"object": "response",
+			"status": "in_progress",
+			"model":  openaiModel,
+		},
+	})
+
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+
+	fullText := ""
+
+	for chunk := range ch {
+		if chunk.Error != nil {
+			logging.Errorf("streamResponsesCompact: stream error: %v", chunk.Error)
+			sendEvent("response.failed", map[string]interface{}{
+				"response": map[string]interface{}{
+					"id":     responseID,
+					"object": "response",
+					"status": "failed",
+					"model":  openaiModel,
+					"error":  map[string]interface{}{"message": chunk.Error.Error()},
+				},
+			})
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+		if chunk.Text != "" {
+			fullText += chunk.Text
+		}
+	}
+
+	// In simulated mode, extract plain content
+	if hasTools {
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			fullText = sim.Content
+		}
+	}
+
+	// Enforce max_output_tokens
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(fullText, maxTokens); ok {
+			fullText = truncated
+		}
+	}
+
+	// Emit the compaction output item
+	sendEvent("response.output_item.added", map[string]interface{}{
+		"output_index": 0,
+		"item": map[string]interface{}{
+			"id":   compactionID,
+			"type": "compaction",
+		},
+	})
+
+	sendEvent("response.output_item.done", map[string]interface{}{
+		"output_index": 0,
+		"item": map[string]interface{}{
+			"id":                compactionID,
+			"type":              "compaction",
+			"encrypted_content": fullText,
+		},
+	})
+
+	// Build final response object for response.completed
+	promptStr := fmt.Sprint(messages)
+	promptTok := countTokens(promptStr)
+	completionTok := countTokens(fullText)
+
+	finalResponse := buildCompactionResponseObject(responseID, openaiModel, fullText, promptTok, completionTok)
 
 	sendEvent("response.completed", map[string]interface{}{
 		"response": finalResponse,
