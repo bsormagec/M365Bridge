@@ -4,6 +4,7 @@ package servers
 
 import (
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -153,6 +155,8 @@ func (api *APIServer) Start(port int) error {
 	mux.HandleFunc("/v1/responses", api.withAuth(api.handleResponses))
 	mux.HandleFunc("/v1/messages", api.withAuth(api.handleAnthropicMessages))
 	mux.HandleFunc("/v1/complete", api.withAuth(api.handleAnthropicComplete))
+	mux.HandleFunc("/v1/images/generations", api.withAuth(api.handleImageGenerations))
+	mux.HandleFunc("/v1/images/edits", api.withAuth(api.handleImageEdits))
 	mux.HandleFunc("/v1/models", api.withAuth(api.handleModels))
 	mux.HandleFunc("/health", api.handleHealth)
 
@@ -2597,5 +2601,381 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 		if convID := api.m365Client.LastConversationID(); convID != "" {
 			api.ctxCache.Set("session:"+sid, convID)
 		}
+	}
+}
+
+// imageGenerationRequest represents an OpenAI /v1/images/generations request.
+type imageGenerationRequest struct {
+	Prompt         string `json:"prompt"`
+	Model          string `json:"model"`
+	N              int    `json:"n"`
+	Size           string `json:"size"`
+	ResponseFormat string `json:"response_format"`
+	Quality        string `json:"quality"`
+	Style          string `json:"style"`
+	SessionID      string `json:"session_id"`
+	User           string `json:"user"`
+}
+
+// imageDataItem represents a single image in the OpenAI Images API response.
+type imageDataItem struct {
+	URL           string `json:"url,omitempty"`
+	B64JSON       string `json:"b64_json,omitempty"`
+	RevisedPrompt string `json:"revised_prompt,omitempty"`
+}
+
+// urlImagePattern matches markdown image links with HTTP(S) URLs.
+var urlImagePattern = regexp.MustCompile(`!\[[^\]]*\]\((https?://[^)]+)\)`)
+
+// handleImageGenerations handles OpenAI /v1/images/generations requests.
+// It wraps the prompt as a chat completions request to M365, extracts generated
+// image URLs from the response, and returns them in OpenAI Images API format.
+func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		api.handleCORS(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req imageGenerationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return
+	}
+	if req.Prompt == "" {
+		api.sendError(w, http.StatusBadRequest, "prompt is required")
+		return
+	}
+	if req.N <= 0 {
+		req.N = 1
+	}
+
+	// Build prompt with size/quality/style hints appended
+	fullPrompt := buildImagePromptWithHints(req.Prompt, req.Size, req.Quality, req.Style)
+
+	// Resolve model (default to gpt5.5-reasoning for image generation)
+	modelKey := req.Model
+	if modelKey == "" {
+		modelKey = "gpt5.5-reasoning"
+	}
+	modelKey, modelSessionID := parseModelSessionID(modelKey)
+	cfg := models.LookupModel(modelKey)
+	if cfg.OpenAIID == "" {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
+		return
+	}
+
+	// Resolve session ID
+	sid := modelSessionID
+	if sid == "" {
+		sid = req.SessionID
+	}
+	if sid == "" {
+		sid = req.User
+	}
+	if sid == "" {
+		sid = r.Header.Get("X-Session-Id")
+	}
+	if sid == "" {
+		sid = "img-" + uuid.New().String()[:8]
+	}
+
+	var convID string
+	if sid != "" {
+		convID = api.ctxCache.Get("session:" + sid)
+	}
+
+	messages := []payload.Message{{Role: "user", Content: fullPrompt}}
+
+	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	if err != nil {
+		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Image generation failed: %v", err))
+		return
+	}
+
+	// Cache conversation ID
+	if sid != "" {
+		if convID := api.m365Client.LastConversationID(); convID != "" {
+			api.ctxCache.Set("session:"+sid, convID)
+		}
+	}
+
+	// Extract image URLs from markdown in response text
+	dataItems := buildOpenAIImageData(respText, req.N, req.Prompt, req.ResponseFormat)
+	if len(dataItems) == 0 {
+		api.sendError(w, http.StatusInternalServerError, "No images were generated. The model may not have produced an image.")
+		return
+	}
+
+	api.sendJSON(w, http.StatusOK, map[string]interface{}{
+		"created": time.Now().Unix(),
+		"data":    dataItems,
+	})
+}
+
+// handleImageEdits handles OpenAI /v1/images/edits requests.
+// It accepts multipart/form-data with an image file, prompt, and optional mask,
+// uploads the image to M365, sends the edit prompt, and returns the result.
+func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		api.handleCORS(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	// Parse multipart form
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to parse multipart form: %v", err))
+		return
+	}
+
+	prompt := r.FormValue("prompt")
+	if prompt == "" {
+		api.sendError(w, http.StatusBadRequest, "prompt is required")
+		return
+	}
+
+	modelKey := r.FormValue("model")
+	if modelKey == "" {
+		modelKey = "gpt5.5-reasoning"
+	}
+	modelKey, modelSessionID := parseModelSessionID(modelKey)
+	cfg := models.LookupModel(modelKey)
+	if cfg.OpenAIID == "" {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
+		return
+	}
+
+	n := 1
+	if nStr := r.FormValue("n"); nStr != "" {
+		if v, err := fmtAtoi(nStr); err == nil && v > 0 {
+			n = v
+		}
+	}
+	size := r.FormValue("size")
+	quality := r.FormValue("quality")
+	style := r.FormValue("style")
+	responseFormat := r.FormValue("response_format")
+
+	// Read image file
+	imageFile, imageHeader, err := r.FormFile("image")
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, "image file is required")
+		return
+	}
+	defer imageFile.Close()
+
+	imageBytes, err := io.ReadAll(imageFile)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read image: %v", err))
+		return
+	}
+
+	imageB64 := base64.StdEncoding.EncodeToString(imageBytes)
+	mimeType := imageHeader.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = "image/png"
+	}
+	fileExt := extFromMediaType(mimeType)
+	fileName := "edit." + fileExt
+
+	// Read optional mask
+	var maskB64, maskFileName, maskMimeType string
+	if maskFile, maskHeader, err := r.FormFile("mask"); err == nil {
+		maskBytes, err := io.ReadAll(maskFile)
+		maskFile.Close()
+		if err != nil {
+			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read mask: %v", err))
+			return
+		}
+		maskB64 = base64.StdEncoding.EncodeToString(maskBytes)
+		maskMimeType = maskHeader.Header.Get("Content-Type")
+		if maskMimeType == "" {
+			maskMimeType = "image/png"
+		}
+		maskFileName = "mask." + extFromMediaType(maskMimeType)
+	}
+
+	// Resolve session ID
+	sid := modelSessionID
+	if sid == "" {
+		sid = r.FormValue("session_id")
+	}
+	if sid == "" {
+		sid = r.FormValue("user")
+	}
+	if sid == "" {
+		sid = r.Header.Get("X-Session-Id")
+	}
+	if sid == "" {
+		sid = "img-edit-" + uuid.New().String()[:8]
+	}
+
+	var convID string
+	if sid != "" {
+		convID = api.ctxCache.Get("session:" + sid)
+	}
+
+	// Build prompt with hints
+	fullPrompt := buildImagePromptWithHints(prompt, size, quality, style)
+
+	// Build multimodal message with image annotation
+	msg := payload.Message{Role: "user", Content: fullPrompt}
+	msg.Images = append(msg.Images, payload.ImageData{
+		Base64:    imageB64,
+		MediaType: mimeType,
+		FileName:  fileName,
+	})
+	if maskB64 != "" {
+		msg.Images = append(msg.Images, payload.ImageData{
+			Base64:    maskB64,
+			MediaType: maskMimeType,
+			FileName:  maskFileName,
+		})
+	}
+
+	messages := []payload.Message{msg}
+
+	// Upload images and attach annotations
+	api.uploadImagesAndAnnotate(&messages, convID)
+
+	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	if err != nil {
+		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Image edit failed: %v", err))
+		return
+	}
+
+	// Cache conversation ID
+	if sid != "" {
+		if convID := api.m365Client.LastConversationID(); convID != "" {
+			api.ctxCache.Set("session:"+sid, convID)
+		}
+	}
+
+	// Extract image URLs from response
+	dataItems := buildOpenAIImageData(respText, n, prompt, responseFormat)
+	if len(dataItems) == 0 {
+		api.sendError(w, http.StatusInternalServerError, "No edited images were generated. The model may not have produced an image.")
+		return
+	}
+
+	api.sendJSON(w, http.StatusOK, map[string]interface{}{
+		"created": time.Now().Unix(),
+		"data":    dataItems,
+	})
+}
+
+// buildImagePromptWithHints appends size, quality, and style hints to the prompt
+// as natural language, since M365 does not accept these as direct parameters.
+func buildImagePromptWithHints(prompt, size, quality, style string) string {
+	var hints []string
+	if size != "" && size != "1024x1024" {
+		hints = append(hints, fmt.Sprintf("size: %s", size))
+	}
+	if quality != "" && quality != "standard" {
+		hints = append(hints, fmt.Sprintf("quality: %s", quality))
+	}
+	if style != "" && style != "natural" {
+		hints = append(hints, fmt.Sprintf("style: %s", style))
+	}
+	if len(hints) == 0 {
+		return prompt
+	}
+	return fmt.Sprintf("%s\n\nImage specifications: %s", prompt, strings.Join(hints, ", "))
+}
+
+// buildOpenAIImageData extracts image URLs from markdown in the response text
+// and converts them to OpenAI Images API data items. When responseFormat is
+// "b64_json", it downloads each URL and base64-encodes the content.
+func buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat string) []imageDataItem {
+	urls := urlImagePattern.FindAllStringSubmatch(respText, -1)
+	if len(urls) == 0 {
+		return nil
+	}
+
+	// Deduplicate URLs
+	seen := map[string]bool{}
+	var uniqueURLs []string
+	for _, match := range urls {
+		u := match[1]
+		if !seen[u] {
+			seen[u] = true
+			uniqueURLs = append(uniqueURLs, u)
+		}
+	}
+
+	if n > 0 && n < len(uniqueURLs) {
+		uniqueURLs = uniqueURLs[:n]
+	}
+
+	var items []imageDataItem
+	for _, u := range uniqueURLs {
+		if responseFormat == "b64_json" {
+			b64, err := downloadAndBase64(u)
+			if err != nil {
+				log.Printf("Failed to download image %s: %v", u, err)
+				continue
+			}
+			items = append(items, imageDataItem{
+				B64JSON:       b64,
+				RevisedPrompt: revisedPrompt,
+			})
+		} else {
+			items = append(items, imageDataItem{
+				URL:           u,
+				RevisedPrompt: revisedPrompt,
+			})
+		}
+	}
+
+	return items
+}
+
+// downloadAndBase64 downloads an image URL and returns its base64-encoded content.
+func downloadAndBase64(url string) (string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return base64.StdEncoding.EncodeToString(body), nil
+}
+
+// fmtAtoi parses an int from a string without importing strconv.
+func fmtAtoi(s string) (int, error) {
+	var n int
+	_, err := fmt.Sscanf(s, "%d", &n)
+	return n, err
+}
+
+// extFromMediaType returns the file extension for a given MIME type.
+func extFromMediaType(mediaType string) string {
+	switch strings.ToLower(mediaType) {
+	case "image/png":
+		return "png"
+	case "image/jpeg":
+		return "jpg"
+	case "image/gif":
+		return "gif"
+	case "image/webp":
+		return "webp"
+	default:
+		return "png"
 	}
 }
