@@ -432,6 +432,7 @@ print(resp.choices[0].message.content)
 | `POST /v1/chat/completions`   | OpenAI Chat Completions (streaming + non-streaming) |
 | `POST /v1/completions`        | OpenAI text completion (streaming + non-streaming)  |
 | `POST /v1/responses`          | OpenAI Responses API (streaming + non-streaming)    |
+| `POST /v1/responses/compact`  | OpenAI Responses Compact API (Codex remote compaction) |
 | `POST /v1/messages`           | Anthropic Messages format (dedicated SSE handlers)  |
 | `POST /v1/complete`           | Anthropic Complete (FIM)                            |
 | `POST /v1/images/generations` | OpenAI Images API: generate from text (JSON body)   |
@@ -659,6 +660,56 @@ The streaming endpoint emits typed SSE events:
 | `response.function_call_arguments.done` | Tool call arguments complete |
 | `response.completed` | Full response object (status: completed) |
 | `response.failed` | Error occurred (status: failed) |
+
+## Responses Compact API
+
+The `/v1/responses/compact` endpoint implements the OpenAI Responses Compact API for Codex remote compaction. It accepts the same request body as `/v1/responses` (model, input, instructions, tools, stream) and returns a compacted response containing exactly one `compaction` output item.
+
+### How It Works
+
+1. The conversation history (input items) is flattened into a single user message with a compaction prompt
+2. The message is sent to M365 Copilot to generate a concise summary
+3. The summary is returned wrapped in a `compaction` output item with `encrypted_content` field
+
+### Example (non-streaming)
+
+```bash
+curl http://127.0.0.1:8000/v1/responses/compact \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "model": "gpt5.5-reasoning",
+    "input": [
+      {"role": "user", "content": "Fix the auth bug in sso.go"},
+      {"role": "assistant", "content": "I added the missing sso_reload parameter."},
+      {"role": "user", "content": "Now add logging to the refresh path"}
+    ]
+  }'
+```
+
+Response:
+
+```json
+{
+  "id": "resp_...",
+  "object": "response",
+  "status": "completed",
+  "output": [{
+    "id": "cmp_...",
+    "type": "compaction",
+    "encrypted_content": "The conversation focused on fixing an SSO auth bug..."
+  }]
+}
+```
+
+### Streaming
+
+Streaming mode emits the same SSE event sequence as `/v1/responses` (`response.created`, `response.in_progress`, `response.output_item.added`, `response.output_item.done`, `response.completed`, `[DONE]`), but the output item has `type: "compaction"` instead of `type: "message"`.
+
+### Notes
+
+- Custom `instructions` in the request body override the default compaction prompt
+- The compaction request should use a new session ID (not reuse an existing conversation) for best results
 
 ## Project Structure
 

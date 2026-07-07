@@ -432,6 +432,7 @@ print(resp.choices[0].message.content)
 | `POST /v1/chat/completions`   | OpenAI Chat Completions (akışlı + akışsız)        |
 | `POST /v1/completions`        | OpenAI metin tamamlama (akışlı + akışsız)         |
 | `POST /v1/responses`          | OpenAI Responses API (akışlı + akışsız)           |
+| `POST /v1/responses/compact`  | OpenAI Responses Compact API (Codex uzaktan sıkıştırma) |
 | `POST /v1/messages`           | Anthropic Messages formatı (özel SSE işleyiciler) |
 | `POST /v1/complete`           | Anthropic Complete (FIM)                          |
 | `POST /v1/images/generations` | OpenAI Images API: metinden üret (JSON body)      |
@@ -659,6 +660,56 @@ Streaming uç noktası tipli SSE olayları yayınlar:
 | `response.function_call_arguments.done`  | Tool call argümanları tamamlandı                                  |
 | `response.completed`                     | Tam response nesnesi (status: completed)                          |
 | `response.failed`                        | Hata oluştu (status: failed)                                      |
+
+## Responses Compact API
+
+`/v1/responses/compact` uç noktası, Codex uzaktan sıkıştırma için OpenAI Responses Compact API'yi uygular. `/v1/responses` ile aynı istek gövdesini kabul eder (model, input, instructions, tools, stream) ve tam olarak bir `compaction` output item içeren sıkıştırılmış bir response döndürür.
+
+### Nasıl Çalışır
+
+1. Konuşma geçmişi (input items) bir compaction prompt ile tek bir user mesajına düzleştirilir
+2. Mesaj, özet üretmek için M365 Copilot'a gönderilir
+3. Özet, `encrypted_content` alanına sahip bir `compaction` output item içinde döndürülür
+
+### Örnek (akışsız)
+
+```bash
+curl http://127.0.0.1:8000/v1/responses/compact \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "model": "gpt5.5-reasoning",
+    "input": [
+      {"role": "user", "content": "sso.go içindeki auth bug'ını düzelt"},
+      {"role": "assistant", "content": "Eksik sso_reload parametresini ekledim."},
+      {"role": "user", "content": "Şimdi refresh yoluna logging ekle"}
+    ]
+  }'
+```
+
+Yanıt:
+
+```json
+{
+  "id": "resp_...",
+  "object": "response",
+  "status": "completed",
+  "output": [{
+    "id": "cmp_...",
+    "type": "compaction",
+    "encrypted_content": "Konuşma bir SSO auth bug'ını düzeltmeye odaklandı..."
+  }]
+}
+```
+
+### Akışlı Mod
+
+Akışlı mod, `/v1/responses` ile aynı SSE event dizisini yayar (`response.created`, `response.in_progress`, `response.output_item.added`, `response.output_item.done`, `response.completed`, `[DONE]`), ancak output item `type: "compaction"` olur.
+
+### Notlar
+
+- İstek gövdesinde özel `instructions` verilirse varsayılan compaction prompt'unun yerine geçer
+- En iyi sonuç için compaction isteği yeni bir session ID kullanmalıdır (mevcut konuşmayı tekrar kullanmamalıdır)
 
 ## Proje Yapısı
 
