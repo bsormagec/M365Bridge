@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -179,6 +180,8 @@ func (api *APIServer) Start(port int) error {
 
 // runTokenRefresher periodically refreshes the access token in the background.
 // This prevents the first request after token expiry from blocking 1-2 seconds.
+// Also refreshes the designerapp broker token to keep the broker refresh token
+// alive (broker RT has a 24h lifetime and must be rotated before expiry).
 func (api *APIServer) runTokenRefresher() {
 	ticker := time.NewTicker(tokenRefreshInterval)
 	defer ticker.Stop()
@@ -192,6 +195,10 @@ func (api *APIServer) runTokenRefresher() {
 				log.Printf("Background token refresh failed: %v", err)
 			} else {
 				log.Println("Background token refresh succeeded")
+			}
+			// Refresh designer token to keep broker RT rotated
+			if _, err := api.tokenManager.GetDesignerToken(); err != nil {
+				log.Printf("Background designer token refresh failed: %v", err)
 			}
 		}
 	}
@@ -2704,7 +2711,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Extract image URLs from markdown in response text
-	dataItems := buildOpenAIImageData(respText, req.N, req.Prompt, req.ResponseFormat)
+	dataItems := api.buildOpenAIImageData(respText, req.N, req.Prompt, req.ResponseFormat)
 	if len(dataItems) == 0 {
 		api.sendError(w, http.StatusInternalServerError, "No images were generated. The model may not have produced an image.")
 		return
@@ -2859,7 +2866,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract image URLs from response
-	dataItems := buildOpenAIImageData(respText, n, prompt, responseFormat)
+	dataItems := api.buildOpenAIImageData(respText, n, prompt, responseFormat)
 	if len(dataItems) == 0 {
 		api.sendError(w, http.StatusInternalServerError, "No edited images were generated. The model may not have produced an image.")
 		return
@@ -2892,8 +2899,11 @@ func buildImagePromptWithHints(prompt, size, quality, style string) string {
 
 // buildOpenAIImageData extracts image URLs from markdown in the response text
 // and converts them to OpenAI Images API data items. When responseFormat is
-// "b64_json", it downloads each URL and base64-encodes the content.
-func buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat string) []imageDataItem {
+// "b64_json", it downloads each URL and base64-encodes the content. When
+// responseFormat is "url", it also downloads the image and returns a
+// data:image/png;base64,... data URL (falling back to the raw URL on error)
+// since the raw designerapp URL is auth-gated and inaccessible to clients.
+func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat string) []imageDataItem {
 	urls := urlImagePattern.FindAllStringSubmatch(respText, -1)
 	if len(urls) == 0 {
 		return nil
@@ -2917,9 +2927,13 @@ func buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat 
 	var items []imageDataItem
 	for _, u := range uniqueURLs {
 		if responseFormat == "b64_json" {
-			b64, err := downloadAndBase64(u)
+			b64, err := api.downloadAndBase64(u)
 			if err != nil {
 				log.Printf("Failed to download image %s: %v", u, err)
+				items = append(items, imageDataItem{
+					URL:           u,
+					RevisedPrompt: revisedPrompt,
+				})
 				continue
 			}
 			items = append(items, imageDataItem{
@@ -2927,8 +2941,19 @@ func buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat 
 				RevisedPrompt: revisedPrompt,
 			})
 		} else {
+			// url format: try to download and return as data URL;
+			// fall back to raw URL on error
+			b64, err := api.downloadAndBase64(u)
+			if err != nil {
+				log.Printf("Failed to download image for data URL %s: %v", u, err)
+				items = append(items, imageDataItem{
+					URL:           u,
+					RevisedPrompt: revisedPrompt,
+				})
+				continue
+			}
 			items = append(items, imageDataItem{
-				URL:           u,
+				URL:           "data:image/png;base64," + b64,
 				RevisedPrompt: revisedPrompt,
 			})
 		}
@@ -2937,16 +2962,61 @@ func buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat 
 	return items
 }
 
-// downloadAndBase64 downloads an image URL and returns its base64-encoded content.
-func downloadAndBase64(url string) (string, error) {
-	resp, err := http.Get(url)
+// downloadAndBase64 downloads an image from a designerapp URL and returns its
+// base64-encoded content. designerapp URLs require a JWE access token (acquired
+// via SSO cookies with the M365 web app client_id) and the fileToken query
+// parameter sent as a header.
+func (api *APIServer) downloadAndBase64(imageURL string) (string, error) {
+	parsedURL, err := neturl.Parse(imageURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid image URL: %w", err)
+	}
+
+	// Extract fileToken from query params and remove it from the URL
+	query := parsedURL.Query()
+	fileToken := query.Get("fileToken")
+	if fileToken == "" {
+		return "", fmt.Errorf("no fileToken in image URL")
+	}
+	query.Del("fileToken")
+	parsedURL.RawQuery = query.Encode()
+	cleanURL := parsedURL.String()
+
+	// Acquire designerapp access token via SSO cookies
+	token, err := api.tokenManager.GetDesignerToken()
+	if err != nil {
+		return "", fmt.Errorf("failed to acquire designer token: %w", err)
+	}
+
+	req, err := http.NewRequest("GET", cleanURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create image request: %w", err)
+	}
+	req.Header.Set("Authorization", token)
+	req.Header.Set("filetoken", fileToken)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Origin", "https://m365.cloud.microsoft")
+	req.Header.Set("Referer", "https://m365.cloud.microsoft/")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		errCode := resp.Header.Get("X-Errorcode")
+		failReason := resp.Header.Get("X-Failurereason")
+		log.Printf("Image download failed: status=%d, x-errorcode=%s, x-failurereason=%s, body=%s",
+			resp.StatusCode, errCode, failReason, string(body)[:min(200, len(body))])
+		return "", fmt.Errorf("download returned status %d: x-errorcode=%s, x-failurereason=%s", resp.StatusCode, errCode, failReason)
 	}
 
 	body, err := io.ReadAll(resp.Body)

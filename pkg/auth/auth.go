@@ -46,6 +46,7 @@ type TokenManager struct {
 	refreshFile string
 	cacheFile   string
 	tokenURL    string
+	userOID     string
 }
 
 // NewTokenManager creates a new TokenManager instance.
@@ -58,6 +59,11 @@ func NewTokenManager(tenant, clientID, scope, refreshFile, cacheFile string) *To
 		cacheFile:   cacheFile,
 		tokenURL:    fmt.Sprintf(tokenURLTemplate, tenant),
 	}
+}
+
+// SetUserOID sets the user object ID for broker token requests.
+func (tm *TokenManager) SetUserOID(oid string) {
+	tm.userOID = oid
 }
 
 // Get returns a valid access token, refreshing if necessary.

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"regexp"
@@ -311,6 +312,11 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 					continue
 				}
 
+				// DEBUG: log every WebSocket message type and target
+				if mt, ok := data["type"].(float64); ok {
+					target, _ := data["target"].(string)
+					log.Printf("DEBUG ConvWS raw: type=%d target=%s", int(mt), target)
+				}
 				if msgType, ok := data["type"].(float64); ok && int(msgType) == 1 {
 					if target, ok := data["target"].(string); ok && target == "update" {
 						if args, ok := data["arguments"].([]interface{}); ok {
@@ -329,6 +335,14 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 									}
 									// Handle messages[] - extract thinking from Progress messages and text from last message
 									if msgs, ok := argMap["messages"].([]interface{}); ok && len(msgs) > 0 {
+										// DEBUG: log all messages' messageType and contentOrigin
+										for _, msg := range msgs {
+											if msgMap, ok := msg.(map[string]interface{}); ok {
+												mt, _ := msgMap["messageType"].(string)
+												co, _ := msgMap["contentOrigin"].(string)
+												log.Printf("DEBUG WS msg: messageType=%s contentOrigin=%s keys=%v", mt, co, mapKeys(msgMap))
+											}
+										}
 										// Scan all messages for thinking and image generation (Progress messages)
 										for _, msg := range msgs {
 											if msgMap, ok := msg.(map[string]interface{}); ok {
@@ -493,11 +507,27 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 				}
 
 
+				// DEBUG: log every WebSocket message type and target (ConvStream)
+				if mt, ok := data["type"].(float64); ok {
+					target, _ := data["target"].(string)
+					log.Printf("DEBUG ConvStream raw: type=%d target=%s", int(mt), target)
+				}
+				// DEBUG: log type=6 message content
+				if mt, ok := data["type"].(float64); ok && int(mt) == 6 {
+					j, _ := json.Marshal(data)
+					s := string(j)
+					if len(s) > 3000 {
+						s = s[:3000] + "...(truncated)"
+					}
+					log.Printf("DEBUG ConvStream type=6: %s", s)
+				}
 				if msgType, ok := data["type"].(float64); ok && int(msgType) == 1 {
 					if target, ok := data["target"].(string); ok && target == "update" {
 						if args, ok := data["arguments"].([]interface{}); ok {
 							for _, arg := range args {
 								if argMap, ok := arg.(map[string]interface{}); ok {
+									// DEBUG: log all keys in argMap
+									log.Printf("DEBUG ConvStream argMap keys: %v", mapKeys(argMap))
 									// Extract conversationId from type:1 update if present (rare)
 									if convID, ok := argMap["conversationId"].(string); ok && convID != "" {
 										c.connMutex.Lock()
@@ -505,6 +535,14 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 										c.connMutex.Unlock()
 									}
 									if msgs, ok := argMap["messages"].([]interface{}); ok {
+										// DEBUG: log all messages' messageType and contentOrigin
+										for _, msg := range msgs {
+											if msgMap, ok := msg.(map[string]interface{}); ok {
+												mt, _ := msgMap["messageType"].(string)
+												co, _ := msgMap["contentOrigin"].(string)
+												log.Printf("DEBUG ConvWS msg: messageType=%s contentOrigin=%s keys=%v", mt, co, mapKeys(msgMap))
+											}
+										}
 										// Check all messages for tool calls and thinking
 										for _, msg := range msgs {
 											if msgMap, ok := msg.(map[string]interface{}); ok {
@@ -807,6 +845,14 @@ func extractImageGenerationMarkdown(msg map[string]interface{}, seenImages map[s
 		if !ok {
 			continue
 		}
+		// DEBUG: log full progress item as JSON (truncated to 2000 chars)
+		if j, err := json.Marshal(itemMap); err == nil {
+			s := string(j)
+			if len(s) > 2000 {
+				s = s[:2000] + "...(truncated)"
+			}
+			log.Printf("DEBUG ImageGen progress item JSON: %s", s)
+		}
 		urls, ok := itemMap["ImageReferenceUrls"].([]interface{})
 		if !ok {
 			continue
@@ -825,4 +871,13 @@ func extractImageGenerationMarkdown(msg map[string]interface{}, seenImages map[s
 	}
 
 	return strings.Join(parts, "")
+}
+
+// mapKeys returns the keys of a map as a slice (for debug logging).
+func mapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

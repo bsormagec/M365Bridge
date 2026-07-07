@@ -348,3 +348,370 @@ func (tm *TokenManager) exchangeAuthCode(authCode, verifier, cookieHeader string
 
 	return result.AccessToken, nil
 }
+
+// designerTokenCacheFile stores the designerapp access token cache.
+const designerTokenCacheFile = "data/tokens/designer_token_cache.json"
+
+// designerBrokerRefreshFile stores the broker-compatible refresh token.
+// This refresh token is obtained via SSO cookie broker authorize flow and
+// is separate from the standard refresh token (rt_90day.txt) because the
+// broker flow requires a refresh token issued for brk-multihub:// redirect URI.
+const designerBrokerRefreshFile = "data/tokens/rt_broker.txt"
+
+// designerClientID is the M365 web app client_id used for designerapp tokens.
+// This is the "brokered" app that the broker (c0ab8ce9) acquires tokens on
+// behalf of.
+const designerClientID = "4765445b-32c6-49b0-83e6-1d93765276ca"
+
+// designerBrokerScope is the OAuth2 scope for the broker token request.
+// The .default scope for the designerappservice resource is what MSAL.js
+// uses when acquiring tokens for image downloads.
+const designerBrokerScope = "https://designerappservice.officeapps.live.com/.default openid profile offline_access"
+
+// designerBrokerRedirectURI is the redirect URI used in the broker token
+// request body. MSAL.js uses the brk-multihub scheme for brokered flows.
+const designerBrokerRedirectURI = "brk-multihub://outlook.office.com"
+
+// brokerClientID is the broker app client_id used in broker token requests.
+// This is always c0ab8ce9 (the M365 Copilot broker app), regardless of the
+// configured M365_CLIENT_ID, because the broker flow requires the broker
+// app's client_id to acquire tokens on behalf of the brokered app (4765445b).
+const brokerClientID = "c0ab8ce9-e9a0-42e7-b064-33d422df41f1"
+
+// designerTokenCache is the on-disk cache for the designerapp access token.
+type designerTokenCache struct {
+	AccessToken string `json:"access_token"`
+	ExpiresAt   int64  `json:"expires_at"`
+}
+
+// GetDesignerToken returns a valid designerapp access token, acquiring a new
+// one via the broker refresh token flow if the cached token is expired or
+// missing. Falls back to SSO cookie broker authorize flow if no broker
+// refresh token is available.
+func (tm *TokenManager) GetDesignerToken() (string, error) {
+	// Check cache first
+	data, err := os.ReadFile(designerTokenCacheFile)
+	if err == nil {
+		var cache designerTokenCache
+		if json.Unmarshal(data, &cache) == nil {
+			if time.Now().Unix() < cache.ExpiresAt-60 {
+				return cache.AccessToken, nil
+			}
+		}
+	}
+
+	// Acquire new token via broker refresh token flow
+	token, expiresIn, err := tm.acquireDesignerToken()
+	if err != nil {
+		return "", err
+	}
+
+	// Cache it
+	cache := designerTokenCache{
+		AccessToken: token,
+		ExpiresAt:   time.Now().Add(time.Duration(expiresIn) * time.Second).Unix(),
+	}
+	cacheData, _ := json.Marshal(cache)
+	os.WriteFile(designerTokenCacheFile, cacheData, 0600)
+
+	return token, nil
+}
+
+// acquireDesignerToken performs a broker refresh token request to obtain a
+// JWE access token for designerapp.officeapps.live.com image downloads.
+// Uses a broker-compatible refresh token (stored in rt_broker.txt). If none
+// exists, falls back to SSO cookie broker authorize flow to obtain one.
+func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
+	// Try broker refresh token first
+	refreshToken, err := tm.readBrokerRefreshToken()
+	if err != nil {
+		// No broker refresh token; acquire one via SSO cookies
+		refreshToken, err = tm.acquireBrokerRefreshTokenViaSSO()
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to acquire broker refresh token: %w", err)
+		}
+	}
+
+	// Build the broker token URL with query parameters
+	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token?brk_client_id=%s&brk_redirect_uri=%s&client_id=%s&client-request-id=%s",
+		tm.tenant,
+		designerClientID,
+		url.QueryEscape(defaultRedirectURI),
+		brokerClientID,
+		generateClientRequestID(),
+	)
+
+	// Build the request body matching MSAL.js broker flow
+	body := url.Values{
+		"client_id":                {brokerClientID},
+		"redirect_uri":             {designerBrokerRedirectURI},
+		"scope":                    {designerBrokerScope},
+		"grant_type":               {"refresh_token"},
+		"client_info":              {"1"},
+		"x-client-SKU":             {"msal.js.browser"},
+		"x-client-VER":             {"5.9.0"},
+		"x-ms-lib-capability":      {"retry-after, h429"},
+		"x-client-current-telemetry": {"5|61,0,,,|,"},
+		"x-client-last-telemetry":    {"5|0|||0,0"},
+		"refresh_token":            {refreshToken},
+	}
+
+	// X-AnchorMailbox helps AAD route the request to the correct token service
+	if tm.userOID != "" {
+		body.Set("X-AnchorMailbox", fmt.Sprintf("Oid:%s@%s", tm.userOID, tm.tenant))
+	}
+
+	// brk_ params go in both URL query and body (MSAL.js sends them in both)
+	body.Set("brk_client_id", designerClientID)
+	body.Set("brk_redirect_uri", defaultRedirectURI)
+
+	bodyEncoded := body.Encode()
+
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(bodyEncoded))
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to create designer broker token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
+	req.Header.Set("Origin", "https://m365.cloud.microsoft")
+	req.Header.Set("Referer", "https://m365.cloud.microsoft/")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, fmt.Errorf("designer broker token request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to read designer broker token response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, fmt.Errorf("designer broker token status %d: %s", resp.StatusCode, string(respBody)[:min(300, len(respBody))])
+	}
+
+	var result struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", 0, fmt.Errorf("failed to parse designer broker token response: %w", err)
+	}
+
+	// Save rotated broker refresh token if returned
+	if result.RefreshToken != "" {
+		tm.writeBrokerRefreshToken(result.RefreshToken)
+	}
+
+	return result.AccessToken, result.ExpiresIn, nil
+}
+
+// acquireBrokerRefreshTokenViaSSO performs a broker authorize flow using SSO
+// cookies to obtain a broker-compatible refresh token. This is needed because
+// the standard refresh token (issued for spalanding redirect URI) is not
+// compatible with the broker flow (which requires brk-multihub:// redirect URI).
+func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
+	store, err := tm.loadSSOCookies()
+	if err != nil {
+		return "", fmt.Errorf("no SSO cookies for broker authorize: %w", err)
+	}
+
+	var cookieParts []string
+	for _, c := range store.Cookies {
+		cookieParts = append(cookieParts, c.Name+"="+c.Value)
+	}
+	cookieHeader := strings.Join(cookieParts, "; ")
+
+	verifier, challenge, err := generatePKCE()
+	if err != nil {
+		return "", fmt.Errorf("PKCE failed: %w", err)
+	}
+
+	// Broker authorize URL with PKCE and brk_ params
+	params := url.Values{
+		"client_id":             {brokerClientID},
+		"response_type":         {"code"},
+		"redirect_uri":          {designerBrokerRedirectURI},
+		"scope":                 {designerBrokerScope},
+		"response_mode":         {"fragment"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"brk_client_id":         {designerClientID},
+		"brk_redirect_uri":      {defaultRedirectURI},
+		"sso_reload":            {"True"},
+	}
+
+	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tm.tenant)
+	authReq, err := http.NewRequest("GET", authorizeURL+"?"+params.Encode(), nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create broker authorize request: %w", err)
+	}
+	authReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+	authReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	authReq.Header.Set("Cookie", cookieHeader)
+
+	httpClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	resp, err := httpClient.Do(authReq)
+	if err != nil && !strings.Contains(err.Error(), "ErrUseLastResponse") {
+		return "", fmt.Errorf("broker authorize request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// The redirect should be to https://m365.cloud.microsoft/spalanding#code=...
+	// because AAD redirects to brk_redirect_uri, not redirect_uri
+	location := resp.Header.Get("Location")
+	if location == "" {
+		body, _ := io.ReadAll(resp.Body)
+		bodyStr := string(body)
+		if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
+			location = metaURL
+		} else {
+			if len(bodyStr) > 500 {
+				bodyStr = bodyStr[:500]
+			}
+			return "", fmt.Errorf("no redirect from broker authorize (status %d): %s", resp.StatusCode, bodyStr)
+		}
+	}
+
+	// Extract auth code from fragment
+	locURL, err := url.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse broker redirect URL: %w", err)
+	}
+
+	authCode := locURL.Query().Get("code")
+	if authCode == "" {
+		fragment := locURL.Fragment
+		if fragment != "" {
+			fragParams, _ := url.ParseQuery(fragment)
+			authCode = fragParams.Get("code")
+			if authCode == "" {
+				return "", fmt.Errorf("broker authorize error: %s: %s", fragParams.Get("error"), fragParams.Get("error_description"))
+			}
+		}
+	}
+	if authCode == "" {
+		return "", fmt.Errorf("no auth code in broker authorize redirect: %s", location[:min(200, len(location))])
+	}
+
+	// Exchange auth code for token + refresh token via broker flow
+	return tm.exchangeBrokerAuthCode(authCode, verifier)
+}
+
+// exchangeBrokerAuthCode exchanges an authorization code for a broker
+// refresh token and designerapp access token.
+func (tm *TokenManager) exchangeBrokerAuthCode(authCode, verifier string) (string, error) {
+	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token?brk_client_id=%s&brk_redirect_uri=%s&client_id=%s&client-request-id=%s",
+		tm.tenant,
+		designerClientID,
+		url.QueryEscape(defaultRedirectURI),
+		brokerClientID,
+		generateClientRequestID(),
+	)
+
+	body := url.Values{
+		"client_id":         {brokerClientID},
+		"redirect_uri":      {designerBrokerRedirectURI},
+		"scope":             {designerBrokerScope},
+		"grant_type":        {"authorization_code"},
+		"code":              {authCode},
+		"code_verifier":     {verifier},
+		"client_info":       {"1"},
+		"brk_client_id":     {designerClientID},
+		"brk_redirect_uri":  {defaultRedirectURI},
+	}
+
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(body.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("failed to create broker code exchange request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
+	req.Header.Set("Origin", "https://m365.cloud.microsoft")
+	req.Header.Set("Referer", "https://m365.cloud.microsoft/")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("broker code exchange failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read broker code exchange response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("broker code exchange status %d: %s", resp.StatusCode, string(respBody)[:min(300, len(respBody))])
+	}
+
+	var result struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("failed to parse broker code exchange response: %w", err)
+	}
+
+	if result.RefreshToken == "" {
+		return "", fmt.Errorf("no refresh token in broker code exchange response")
+	}
+
+	// Save broker refresh token
+	if err := tm.writeBrokerRefreshToken(result.RefreshToken); err != nil {
+		return "", fmt.Errorf("failed to save broker refresh token: %w", err)
+	}
+
+	return result.RefreshToken, nil
+}
+
+// readBrokerRefreshToken reads and decrypts the broker refresh token from file.
+func (tm *TokenManager) readBrokerRefreshToken() (string, error) {
+	data, err := os.ReadFile(designerBrokerRefreshFile)
+	if err != nil {
+		return "", fmt.Errorf("broker refresh token not found: %w", err)
+	}
+
+	encrypted := string(data)
+	if encrypted == "" {
+		return "", fmt.Errorf("broker refresh token file is empty")
+	}
+
+	decrypted, err := crypto.Decrypt(encrypted)
+	if err != nil {
+		return encrypted, nil
+	}
+
+	return decrypted, nil
+}
+
+// writeBrokerRefreshToken encrypts and writes the broker refresh token to file.
+func (tm *TokenManager) writeBrokerRefreshToken(token string) error {
+	encrypted, err := crypto.Encrypt(token)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt broker refresh token: %w", err)
+	}
+
+	dir := filepath.Dir(designerBrokerRefreshFile)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("failed to create directory for broker refresh token: %w", err)
+	}
+
+	return os.WriteFile(designerBrokerRefreshFile, []byte(encrypted), 0600)
+}
+
+// generateClientRequestID generates a UUID for the client-request-id parameter.
+func generateClientRequestID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}

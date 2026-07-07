@@ -24,6 +24,7 @@ Uygulamanız -> M365Bridge -> substrate.office.com (SignalR) -> M365 Copilot Bac
 
 - Akışlı/akışsız çıktı ile metin sohbeti
 - Çok modlu görsel girdi (OpenAI `image_url` ve Anthropic `image` içerik blokları; PNG, JPEG, GIF, WebP)
+- Görsel üretimi (`/v1/images/generations`, `/v1/images/edits`), `url` ve `b64_json` yanıt formatları desteklenir
 - ConversationId takibi ile çok turlu sohbet desteği
 - Oturum izolasyonu (oturum başına ayrı M365 sohbetleri)
 - Düşünme/akıl yürütme içeriği çıkarımı (OpenAI için `reasoning_content`, Anthropic için `thinking` blokları)
@@ -426,15 +427,17 @@ print(resp.choices[0].message.content)
 
 ## API Uç Noktaları
 
-| Uç Nokta                    | Açıklama                                          |
-|-----------------------------|---------------------------------------------------|
-| `POST /v1/chat/completions` | OpenAI Chat Completions (akışlı + akışsız)        |
-| `POST /v1/completions`      | OpenAI metin tamamlama (akışlı + akışsız)         |
-| `POST /v1/responses`        | OpenAI Responses API (akışlı + akışsız)           |
-| `POST /v1/messages`         | Anthropic Messages formatı (özel SSE işleyiciler) |
-| `POST /v1/complete`         | Anthropic Complete (FIM)                          |
-| `GET /v1/models`            | Model listesi                                     |
-| `GET /health`               | Sağlık kontrolü (kimlik doğrulama gerektirmez)    |
+| Uç Nokta                      | Açıklama                                          |
+|-------------------------------|---------------------------------------------------|
+| `POST /v1/chat/completions`   | OpenAI Chat Completions (akışlı + akışsız)        |
+| `POST /v1/completions`        | OpenAI metin tamamlama (akışlı + akışsız)         |
+| `POST /v1/responses`          | OpenAI Responses API (akışlı + akışsız)           |
+| `POST /v1/messages`           | Anthropic Messages formatı (özel SSE işleyiciler) |
+| `POST /v1/complete`           | Anthropic Complete (FIM)                          |
+| `POST /v1/images/generations` | OpenAI Images API: metinden üret (JSON body)      |
+| `POST /v1/images/edits`       | OpenAI Images API: görseli düzenle (multipart)    |
+| `GET /v1/models`              | Model listesi                                     |
+| `GET /health`                 | Sağlık kontrolü (kimlik doğrulama gerektirmez)    |
 
 ## Modeller
 
@@ -640,22 +643,22 @@ curl http://127.0.0.1:8000/v1/responses \
 
 Streaming uç noktası tipli SSE olayları yayınlar:
 
-| Olay | Açıklama |
-|------|----------|
-| `response.created` | Response nesnesi oluşturuldu (status: in_progress) |
-| `response.in_progress` | Response üretiliyor |
-| `response.output_item.added` | Yeni output öğesi eklendi (message, reasoning veya function_call) |
-| `response.content_part.added` | İçerik parçası message öğesine eklendi |
-| `response.output_text.delta` | Metin deltası |
-| `response.output_text.done` | Metin tamamlandı |
-| `response.content_part.done` | İçerik parçası tamamlandı |
-| `response.output_item.done` | Output öğesi tamamlandı |
-| `response.reasoning_summary_text.delta` | Reasoning/düşünme deltası |
-| `response.reasoning_summary_text.done` | Reasoning tamamlandı |
-| `response.function_call_arguments.delta` | Tool call argüman deltası |
-| `response.function_call_arguments.done` | Tool call argümanları tamamlandı |
-| `response.completed` | Tam response nesnesi (status: completed) |
-| `response.failed` | Hata oluştu (status: failed) |
+| Olay                                     | Açıklama                                                          |
+|------------------------------------------|-------------------------------------------------------------------|
+| `response.created`                       | Response nesnesi oluşturuldu (status: in_progress)                |
+| `response.in_progress`                   | Response üretiliyor                                               |
+| `response.output_item.added`             | Yeni output öğesi eklendi (message, reasoning veya function_call) |
+| `response.content_part.added`            | İçerik parçası message öğesine eklendi                            |
+| `response.output_text.delta`             | Metin deltası                                                     |
+| `response.output_text.done`              | Metin tamamlandı                                                  |
+| `response.content_part.done`             | İçerik parçası tamamlandı                                         |
+| `response.output_item.done`              | Output öğesi tamamlandı                                           |
+| `response.reasoning_summary_text.delta`  | Reasoning/düşünme deltası                                         |
+| `response.reasoning_summary_text.done`   | Reasoning tamamlandı                                              |
+| `response.function_call_arguments.delta` | Tool call argüman deltası                                         |
+| `response.function_call_arguments.done`  | Tool call argümanları tamamlandı                                  |
+| `response.completed`                     | Tam response nesnesi (status: completed)                          |
+| `response.failed`                        | Hata oluştu (status: failed)                                      |
 
 ## Proje Yapısı
 
@@ -705,6 +708,63 @@ Proxy, OpenAI ve Anthropic API formatları ile çok modlu görsel girdiyi destek
 - **Anthropic**: `{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}` blokları içeren `content` dizisi
 
 Görseller, `POST https://substrate.office.com/m365Copilot/UploadFile` üzerinden M365 backend'ine yüklenir ve WebSocket mesajına `messageAnnotations` olarak eklenir. Desteklenen formatlar: PNG, JPEG, GIF, WebP.
+
+## Görsel Üretimi
+
+Proxy, M365 Copilot'un  görsel üretimini OpenAI Images API uç noktaları olarak sunar:
+
+- `POST /v1/images/generations` (JSON body): Metin prompt'undan görsel üret
+- `POST /v1/images/edits` (multipart/form-data): Mevcut görseli metin prompt'u ile düzenle
+
+Her iki uç nokta aşağıdaki parametreleri kabul eder:
+
+| Parametre         | Tip    | Varsayılan  | Açıklama                                                                                       |
+|-------------------|--------|-------------|------------------------------------------------------------------------------------------------|
+| `prompt`          | string | (zorunlu)   | Görsel üretimi/düzenleme için metin prompt'u                                                   |
+| `n`               | int    | 1           | Üretilecek görsel sayısı (M365 her istek için bir tane üretir)                                 |
+| `size`            | string | `1024x1024` | Görsel boyut ipucu (prompt'a doğal dil olarak eklenir)                                         |
+| `quality`         | string | `standard`  | Kalite ipucu (prompt'a eklenir; `standard` atlanır)                                            |
+| `style`           | string | `natural`   | Stil ipucu (prompt'a eklenir; `natural` atlanır)                                               |
+| `response_format` | string | `url`       | Yanıt formatı: `url` data URL (base64) döndürür, `b64_json` base64'ü ayrı alanda döndürür      |
+| `session_id`      | string | (opsiyonel) | Konuşma sürekliliği için session ID                                                            |
+
+### Yanıt Formatı
+
+- `response_format=url` (varsayılan): Görseli sunucu tarafında indirir ve `data:image/png;base64,...` data URL olarak döndürür. İndirme başarısız olursa raw `designerapp.officeapps.live.com` URL'ine düşer.
+- `response_format=b64_json`: Görseli sunucu tarafında broker token kullanarak indirir ve base64 ile kodlanmış PNG verisi olarak `b64_json` alanında döndürür.
+
+### Görsel İndirme Token Akışı
+
+Görsel üretildiğinde, proxy `designerappservice.officeapps.live.com` için MSAL.js broker token akışı ile bir JWE access token alır ve görseli indirir (`url` ve `b64_json` formatlarının ikisinde de):
+
+1. Broker app (`c0ab8ce9`), M365 web app (`4765445b`) adına `designerappservice.officeapps.live.com/.default` scope'u ile token alır
+2. Broker uyumlu refresh token `data/tokens/rt_broker.txt`'de (şifreli) saklanır, arka plan token yenileyici tarafından otomatik rotate edilir
+3. Broker refresh token yoksa, SSO cookie broker authorize akışı ile alınır (PKCE + `brk-multihub://outlook.office.com` redirect URI)
+4. JWE token ve `fileToken` header'ı ile görsel `designerapp.officeapps.live.com`'dan indirilir
+5. İndirilen görsel base64 olarak kodlanır ve `b64_json` alanında döndürülür
+
+### Örnek
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8230/v1",
+    api_key="your-api-key",  # API anahtarı yoksa atla
+)
+
+resp = client.images.generate(
+    model="gpt5.5-reasoning",
+    prompt="gün batımında sakin bir dağ manzarası",
+    n=1,
+    response_format="b64_json",
+)
+
+# resp.data[0].b64_json, base64 ile kodlanmış PNG içerir
+import base64
+with open("output.png", "wb") as f:
+    f.write(base64.b64decode(resp.data[0].b64_json))
+```
 
 ## Uygulanmayan Özellikler
 

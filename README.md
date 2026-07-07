@@ -24,6 +24,7 @@ Your App -> M365Bridge -> substrate.office.com (SignalR) -> M365 Copilot Backend
 
 - Text chat with streaming/non-streaming output
 - Multimodal image input (OpenAI `image_url` and Anthropic `image` content blocks; PNG, JPEG, GIF, WebP)
+- Image generation via  (`/v1/images/generations`, `/v1/images/edits`) with `url` and `b64_json` response formats
 - Multi-turn conversation support via ConversationId tracking
 - Session isolation (per-session M365 conversations)
 - Thinking/reasoning content extraction (`reasoning_content` for OpenAI, `thinking` blocks for Anthropic)
@@ -426,15 +427,17 @@ print(resp.choices[0].message.content)
 
 ## API Endpoints
 
-| Endpoint                    | Description                                         |
-|-----------------------------|-----------------------------------------------------|
-| `POST /v1/chat/completions` | OpenAI Chat Completions (streaming + non-streaming) |
-| `POST /v1/completions`      | OpenAI text completion (streaming + non-streaming)  |
-| `POST /v1/responses`        | OpenAI Responses API (streaming + non-streaming)    |
-| `POST /v1/messages`         | Anthropic Messages format (dedicated SSE handlers)  |
-| `POST /v1/complete`         | Anthropic Complete (FIM)                            |
-| `GET /v1/models`            | Model list                                          |
-| `GET /health`               | Health check (no auth required)                     |
+| Endpoint                      | Description                                         |
+|-------------------------------|-----------------------------------------------------|
+| `POST /v1/chat/completions`   | OpenAI Chat Completions (streaming + non-streaming) |
+| `POST /v1/completions`        | OpenAI text completion (streaming + non-streaming)  |
+| `POST /v1/responses`          | OpenAI Responses API (streaming + non-streaming)    |
+| `POST /v1/messages`           | Anthropic Messages format (dedicated SSE handlers)  |
+| `POST /v1/complete`           | Anthropic Complete (FIM)                            |
+| `POST /v1/images/generations` | OpenAI Images API: generate from text (JSON body)   |
+| `POST /v1/images/edits`       | OpenAI Images API: edit existing image (multipart)  |
+| `GET /v1/models`              | Model list                                          |
+| `GET /health`                 | Health check (no auth required)                     |
 
 ## Models
 
@@ -705,6 +708,63 @@ The proxy supports multimodal image input via OpenAI and Anthropic API formats:
 - **Anthropic**: `content` array with `{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}` blocks
 
 Images are uploaded to the M365 backend via `POST https://substrate.office.com/m365Copilot/UploadFile` and attached to the WebSocket message as `messageAnnotations`. Supported formats: PNG, JPEG, GIF, WebP.
+
+## Image Generation
+
+The proxy exposes M365 Copilot's  image generation as OpenAI Images API endpoints:
+
+- `POST /v1/images/generations` (JSON body): Generate images from a text prompt
+- `POST /v1/images/edits` (multipart/form-data): Edit an existing image with a text prompt
+
+Both endpoints accept the following parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | string | (required) | The text prompt for image generation/editing |
+| `n` | int | 1 | Number of images to generate (M365 generates one per request) |
+| `size` | string | `1024x1024` | Image size hint (appended to prompt as natural language) |
+| `quality` | string | `standard` | Quality hint (appended to prompt; `standard` is skipped) |
+| `style` | string | `natural` | Style hint (appended to prompt; `natural` is skipped) |
+| `response_format` | string | `url` | Response format: `url` returns a data URL (base64), `b64_json` returns base64 in a separate field |
+| `session_id` | string | (optional) | Session ID for conversation continuity |
+
+### Response Format
+
+- `response_format=url` (default): Downloads the image server-side and returns a `data:image/png;base64,...` data URL. Falls back to the raw `designerapp.officeapps.live.com` URL if the download fails.
+- `response_format=b64_json`: Downloads the image server-side using a broker token and returns the image as base64-encoded PNG data in the `b64_json` field.
+
+### Image Download Token Flow
+
+When images are generated, the proxy acquires a JWE access token for `designerappservice.officeapps.live.com` via the MSAL.js broker token flow to download the image (used for both `url` and `b64_json` response formats):
+
+1. The broker app (`c0ab8ce9`) acquires a token on behalf of the M365 web app (`4765445b`) with the `designerappservice.officeapps.live.com/.default` scope
+2. A broker-compatible refresh token is stored at `data/tokens/rt_broker.txt` (encrypted), rotated automatically by the background token refresher
+3. If no broker refresh token exists, one is acquired via SSO cookie broker authorize flow (PKCE + `brk-multihub://outlook.office.com` redirect URI)
+4. The JWE token and `fileToken` header are used to download the image from `designerapp.officeapps.live.com`
+5. The downloaded image is base64-encoded and returned in the `b64_json` field
+
+### Example
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8230/v1",
+    api_key="your-api-key",  # omit if no API key configured
+)
+
+resp = client.images.generate(
+    model="gpt5.5-reasoning",
+    prompt="a serene mountain landscape at sunset",
+    n=1,
+    response_format="b64_json",
+)
+
+# resp.data[0].b64_json contains the base64-encoded PNG
+import base64
+with open("output.png", "wb") as f:
+    f.write(base64.b64decode(resp.data[0].b64_json))
+```
 
 ## Unimplemented Features
 

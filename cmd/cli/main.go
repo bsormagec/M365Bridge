@@ -68,6 +68,7 @@ func runServer(args []string) {
 		defaultRefreshTokenFile,
 		defaultCacheFile,
 	)
+	tokenManager.SetUserOID(config.UserOID)
 
 	apiServer := servers.NewAPIServer(config, tokenManager)
 
