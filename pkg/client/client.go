@@ -278,6 +278,7 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 		}
 
 		sentText := ""
+		seenImages := map[string]bool{}
 
 		for {
 			conn.SetReadDeadline(time.Now().Add(c.recvTimeout))
@@ -328,13 +329,20 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 									}
 									// Handle messages[] - extract thinking from Progress messages and text from last message
 									if msgs, ok := argMap["messages"].([]interface{}); ok && len(msgs) > 0 {
-										// Scan all messages for thinking (Progress + ChainOfThoughtSummary)
+										// Scan all messages for thinking and image generation (Progress messages)
 										for _, msg := range msgs {
 											if msgMap, ok := msg.(map[string]interface{}); ok {
 												if mt, _ := msgMap["messageType"].(string); mt == "Progress" {
 													if co, _ := msgMap["contentOrigin"].(string); co == "ChainOfThoughtSummary" {
 														if t, _ := msgMap["text"].(string); t != "" {
 															ch <- StreamChunk{Thinking: t, IsFinal: false}
+														}
+													}
+													// Extract generated image URLs
+													if co, _ := msgMap["contentOrigin"].(string); co == "ImageGeneration" {
+														if imgMD := extractImageGenerationMarkdown(msgMap, seenImages); imgMD != "" {
+															sentText += imgMD
+															ch <- StreamChunk{Text: imgMD, IsFinal: false}
 														}
 													}
 												}
@@ -446,6 +454,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 		}
 
 		toolCalls := []ToolCall{}
+		seenImages := map[string]bool{}
 
 		c.connMutex.Lock()
 		c.lastFullText = ""
@@ -513,6 +522,15 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 																c.lastThinking += t
 																c.connMutex.Unlock()
 																ch <- ConversationStreamChunk{Thinking: t, IsFinal: false}
+															}
+														}
+														// Extract generated image URLs from contentGenerationProgressList
+														if co, _ := msgMap["contentOrigin"].(string); co == "ImageGeneration" {
+															if imgMD := extractImageGenerationMarkdown(msgMap, seenImages); imgMD != "" {
+																c.connMutex.Lock()
+																c.lastFullText += imgMD
+																c.connMutex.Unlock()
+																ch <- ConversationStreamChunk{Text: imgMD, IsFinal: false}
 															}
 														}
 														// Extract web search tool calls from searchQueries field
@@ -771,4 +789,40 @@ func (c *M365Client) LastThinking() string {
 	c.connMutex.RLock()
 	defer c.connMutex.RUnlock()
 	return c.lastThinking
+}
+
+// extractImageGenerationMarkdown extracts image URLs from a Progress message
+// with contentOrigin "ImageGeneration" and returns them as markdown image links.
+// seenImages tracks already-emitted URLs to avoid duplicates (M365 sends the
+// same URL in multiple Progress updates as the image generation completes).
+func extractImageGenerationMarkdown(msg map[string]interface{}, seenImages map[string]bool) string {
+	progressList, ok := msg["contentGenerationProgressList"].([]interface{})
+	if !ok {
+		return ""
+	}
+
+	var parts []string
+	for _, item := range progressList {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		urls, ok := itemMap["ImageReferenceUrls"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, urlVal := range urls {
+			url, ok := urlVal.(string)
+			if !ok || url == "" {
+				continue
+			}
+			if seenImages[url] {
+				continue
+			}
+			seenImages[url] = true
+			parts = append(parts, fmt.Sprintf("\n\n![image](%s)\n\n", url))
+		}
+	}
+
+	return strings.Join(parts, "")
 }
