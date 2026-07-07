@@ -713,8 +713,8 @@ Görseller, `POST https://substrate.office.com/m365Copilot/UploadFile` üzerinde
 
 Proxy, M365 Copilot'un  görsel üretimini OpenAI Images API uç noktaları olarak sunar:
 
-- `POST /v1/images/generations` (JSON body): Metin prompt'undan görsel üret
-- `POST /v1/images/edits` (multipart/form-data): Mevcut görseli metin prompt'u ile düzenle
+- `POST /v1/images/generations` (JSON body): Metin prompt'undan görsel üret (dosya yükleme yok)
+- `POST /v1/images/edits` (multipart/form-data): Mevcut görsel(ler)i metin prompt'u ile düzenle; tekrarlanan `image` form alanları ile 16'ya kadar görsel desteklenir
 
 Her iki uç nokta aşağıdaki parametreleri kabul eder:
 

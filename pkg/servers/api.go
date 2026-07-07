@@ -2770,27 +2770,43 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	style := r.FormValue("style")
 	responseFormat := r.FormValue("response_format")
 
-	// Read image file
-	imageFile, imageHeader, err := r.FormFile("image")
-	if err != nil {
+	// Read image file(s). OpenAI API supports up to 16 images for GPT image models.
+	// Multipart form-data may send "image" as multiple form files.
+	imageFiles := r.MultipartForm.File["image"]
+	if len(imageFiles) == 0 {
 		api.sendError(w, http.StatusBadRequest, "image file is required")
 		return
 	}
-	defer imageFile.Close()
 
-	imageBytes, err := io.ReadAll(imageFile)
-	if err != nil {
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read image: %v", err))
-		return
+	var images []payload.ImageData
+	for i, fh := range imageFiles {
+		if i >= 16 {
+			break
+		}
+		f, err := fh.Open()
+		if err != nil {
+			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to open image %d: %v", i, err))
+			return
+		}
+		imgBytes, err := io.ReadAll(f)
+		f.Close()
+		if err != nil {
+			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read image %d: %v", i, err))
+			return
+		}
+		imgB64 := base64.StdEncoding.EncodeToString(imgBytes)
+		imgMime := fh.Header.Get("Content-Type")
+		if imgMime == "" {
+			imgMime = "image/png"
+		}
+		imgExt := extFromMediaType(imgMime)
+		imgName := fmt.Sprintf("edit-%d.%s", i, imgExt)
+		images = append(images, payload.ImageData{
+			Base64:    imgB64,
+			MediaType: imgMime,
+			FileName:  imgName,
+		})
 	}
-
-	imageB64 := base64.StdEncoding.EncodeToString(imageBytes)
-	mimeType := imageHeader.Header.Get("Content-Type")
-	if mimeType == "" {
-		mimeType = "image/png"
-	}
-	fileExt := extFromMediaType(mimeType)
-	fileName := "edit." + fileExt
 
 	// Read optional mask
 	var maskB64, maskFileName, maskMimeType string
@@ -2832,13 +2848,9 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	// Build prompt with hints
 	fullPrompt := buildImagePromptWithHints(prompt, size, quality, style)
 
-	// Build multimodal message with image annotation
+	// Build multimodal message with image annotations
 	msg := payload.Message{Role: "user", Content: fullPrompt}
-	msg.Images = append(msg.Images, payload.ImageData{
-		Base64:    imageB64,
-		MediaType: mimeType,
-		FileName:  fileName,
-	})
+	msg.Images = images
 	if maskB64 != "" {
 		msg.Images = append(msg.Images, payload.ImageData{
 			Base64:    maskB64,

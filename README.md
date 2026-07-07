@@ -713,8 +713,8 @@ Images are uploaded to the M365 backend via `POST https://substrate.office.com/m
 
 The proxy exposes M365 Copilot's  image generation as OpenAI Images API endpoints:
 
-- `POST /v1/images/generations` (JSON body): Generate images from a text prompt
-- `POST /v1/images/edits` (multipart/form-data): Edit an existing image with a text prompt
+- `POST /v1/images/generations` (JSON body): Generate images from a text prompt (no file upload)
+- `POST /v1/images/edits` (multipart/form-data): Edit existing image(s) with a text prompt; supports up to 16 images via repeated `image` form fields
 
 Both endpoints accept the following parameters:
 
