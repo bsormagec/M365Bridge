@@ -511,15 +511,24 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read request body: %v", err))
+		return
+	}
+	r.Body.Close()
+
 	var req struct {
-		Model     string `json:"model"`
-		Prompt    string `json:"prompt"`
-		Suffix    string `json:"suffix"`
-		Stream    bool   `json:"stream"`
-		MaxTokens int    `json:"max_tokens"`
+		Model      string                `json:"model"`
+		Prompt     string                `json:"prompt"`
+		Suffix     string                `json:"suffix"`
+		Stream     bool                  `json:"stream"`
+		MaxTokens  int                   `json:"max_tokens"`
+		Tools      []toolcalling.ToolDef `json:"tools"`
+		ToolChoice interface{}           `json:"tool_choice"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
@@ -535,6 +544,11 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 	// Convert FIM to chat format
 	messages := api.fimToChat(req.Prompt, req.Suffix)
 
+	// Inject simulated tool prompt if tool calling is enabled
+	if len(req.Tools) > 0 {
+		injectSimulatedPrompt(&messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
+	}
+
 	// Resolve session ID and conversation ID
 	sid := modelSessionID
 	if sid == "" {
@@ -545,10 +559,12 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 		convID = api.ctxCache.Get("session:" + sid)
 	}
 
+	hasTools := len(req.Tools) > 0
+
 	if req.Stream {
-		api.streamCompletions(w, messages, cfg, req.MaxTokens, sid, convID)
+		api.streamCompletions(w, messages, cfg, req.MaxTokens, sid, convID, hasTools, req.Tools)
 	} else {
-		api.nonStreamCompletions(w, messages, cfg, req.MaxTokens, sid, convID)
+		api.nonStreamCompletions(w, messages, cfg, req.MaxTokens, sid, convID, hasTools, req.Tools)
 	}
 }
 
@@ -1483,7 +1499,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 }
 
 // streamCompletions streams text completion responses in OpenAI text_completion format.
-func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string) {
+func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "close")
@@ -1498,11 +1514,12 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	compID := fmt.Sprintf("cmpl-%s", uuid.New().String())
 	openaiModel := cfg.OpenAIID
 
-	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 
 	fullText := ""
 	thinkingText := ""
 	truncated := false
+	toolCallingEnabled := hasTools
 
 	for chunk := range ch {
 		if chunk.Error != nil {
@@ -1547,6 +1564,45 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 
 		fullText += chunk.Text
 
+		// If tool calling is not enabled, stream text directly
+		if !toolCallingEnabled {
+			chunkData := map[string]interface{}{
+				"id":      compID,
+				"object":  "text_completion",
+				"created": time.Now().Unix(),
+				"model":   openaiModel,
+				"choices": []map[string]interface{}{
+					{
+						"index":         0,
+						"text":          chunk.Text,
+						"finish_reason": nil,
+						"logprobs":      nil,
+					},
+				},
+			}
+
+			jsonData, _ := json.Marshal(chunkData)
+			fmt.Fprintf(w, "data: %s\n\n", jsonData)
+			flusher.Flush()
+		}
+	}
+
+	// Parse simulated tool calls from buffered text if tool calling is enabled
+	var simToolCalls []toolcalling.ToolCall
+	if toolCallingEnabled {
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			if len(sim.ToolCalls) > 0 {
+				simToolCalls = sim.ToolCalls
+				fullText = ""
+			} else {
+				fullText = sim.Content
+			}
+		}
+	}
+
+	// If tool calling buffered text, send it now as a single chunk
+	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
 		chunkData := map[string]interface{}{
 			"id":      compID,
 			"object":  "text_completion",
@@ -1555,13 +1611,12 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 			"choices": []map[string]interface{}{
 				{
 					"index":         0,
-					"text":          chunk.Text,
+					"text":          fullText,
 					"finish_reason": nil,
 					"logprobs":      nil,
 				},
 			},
 		}
-
 		jsonData, _ := json.Marshal(chunkData)
 		fmt.Fprintf(w, "data: %s\n\n", jsonData)
 		flusher.Flush()
@@ -1571,6 +1626,9 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	finishReason := "stop"
 	if truncated {
 		finishReason = "length"
+	}
+	if len(simToolCalls) > 0 {
+		finishReason = "tool_calls"
 	}
 	doneChunk := map[string]interface{}{
 		"id":      compID,
@@ -1600,15 +1658,42 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 }
 
 // nonStreamCompletions handles non-streaming text completion.
-func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string) {
-	respText, thinking, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef) {
+	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
 		return
 	}
 
+	// In simulated mode, discard backend-injected tool calls
+	if hasTools {
+		toolCalls = nil
+	}
+
+	// Parse simulated tool calls from response text
+	if hasTools {
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			if len(sim.ToolCalls) > 0 {
+				finishReason = "tool_calls"
+				for _, pc := range sim.ToolCalls {
+					toolCalls = append(toolCalls, client.ToolCall{
+						ID:       pc.ID,
+						Type:     "function",
+						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+					})
+				}
+				respText = ""
+			} else {
+				respText = sim.Content
+				finishReason = "stop"
+			}
+		} else {
+			finishReason = "stop"
+		}
+	}
+
 	// Enforce max_tokens on response text
-	finishReason := "stop"
 	if maxTokens > 0 {
 		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
 			respText = truncated
@@ -1620,25 +1705,46 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 	promptTok := countTokens(promptStr)
 	completionTok := countTokens(respText)
 	reasoningTok := countTokens(thinking)
+
+	// Build choices
+	choices := []map[string]interface{}{
+		{
+			"index":         0,
+			"text":          respText,
+			"finish_reason": finishReason,
+			"logprobs":      nil,
+		},
+	}
+
+	// Add tool calls to response if present (non-standard extension for text_completion)
 	response := map[string]interface{}{
 		"id":      fmt.Sprintf("cmpl-%s", uuid.New().String()),
 		"object":  "text_completion",
 		"created": time.Now().Unix(),
 		"model":   cfg.OpenAIID,
-		"choices": []map[string]interface{}{
-			{
-				"index":         0,
-				"text":          respText,
-				"finish_reason": finishReason,
-				"logprobs":      nil,
-			},
-		},
+		"choices": choices,
 		"usage": map[string]interface{}{
 			"prompt_tokens":     promptTok,
 			"completion_tokens": completionTok,
 			"reasoning_tokens":  reasoningTok,
 			"total_tokens":      promptTok + completionTok + reasoningTok,
 		},
+	}
+
+	if len(toolCalls) > 0 {
+		openaiToolCalls := make([]map[string]interface{}, len(toolCalls))
+		for i, tc := range toolCalls {
+			openaiToolCalls[i] = map[string]interface{}{
+				"index": i,
+				"id":    tc.ID,
+				"type":  "function",
+				"function": map[string]string{
+					"name":      tc.Function.Name,
+					"arguments": tc.Function.Arguments,
+				},
+			}
+		}
+		response["tool_calls"] = openaiToolCalls
 	}
 
 	api.sendJSON(w, http.StatusOK, response)
