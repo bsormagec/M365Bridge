@@ -384,6 +384,21 @@ func BuildConversationPayload(hexSID, uuidSID string, messages []Message, tone, 
 		hasImages = len(annotations) > 0
 	}
 
+	// Merge system messages into the last message as a prefix.
+	// M365 backend tracks conversation history via ConversationId, so only the
+	// last message is sent. System prompts in earlier messages would be lost.
+	// Prepending them to the last message ensures they reach the model.
+	var systemParts []string
+	for _, msg := range messages {
+		if msg.Role == "system" && strings.TrimSpace(msg.Content) != "" {
+			systemParts = append(systemParts, msg.Content)
+		}
+	}
+	if len(systemParts) > 0 {
+		systemPrefix := strings.Join(systemParts, "\n\n")
+		lastText = systemPrefix + "\n\n" + lastText
+	}
+
 	options := getOptions(enableFileUpload, hasImages, hasTools, extraOptions)
 
 	payload := map[string]interface{}{
