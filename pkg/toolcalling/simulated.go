@@ -59,6 +59,48 @@ func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice string) 
 	return strings.Join(lines, "\n")
 }
 
+// BuildSimulatedPromptResponses constructs the prompt sent to M365 Copilot for
+// OpenAI Responses API requests. The embedded request keeps Responses input
+// semantics, while the model returns the existing chat-completion-shaped inner
+// result envelope consumed by ParseSimulatedResponse.
+func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice string) string {
+	lines := []string{
+		"The JSON payload below is an entire request for the OpenAI Responses API.",
+		"The JSON payload below is an entire request for POST /v1/responses.",
+		`Interpret "input" as the complete Responses conversation, including message, function_call, and function_call_output items.`,
+		`Apply "instructions" to the entire request before deciding the answer or tool call.`,
+		`Treat "tools" as the complete list of client-supplied functions and obey "tool_choice" exactly.`,
+		"Produce the result inside the chat-completion-shaped JSON envelope described below; this envelope is only an internal transport format.",
+		"Return exactly one markdown JSON code block containing a single valid JSON object and no surrounding prose.",
+		"Do not include protocol IDs such as chatcmpl-* and do not echo the request payload.",
+		`If the payload has "stream": true, still return the final completed JSON object (not SSE events).`,
+	}
+
+	if hasTools {
+		lines = append(lines,
+			"Tool calls are supported here: emit assistant tool calls when appropriate.",
+			`If returning tool calls, use choices[0].message.tool_calls and set choices[0].finish_reason to "tool_calls".`,
+			`If returning plain text, use choices[0].message.content and set choices[0].finish_reason to "stop".`,
+			"For each tool call, function.arguments must be a JSON string value (not an object).",
+			"CRITICAL: Only use tool names that appear in the tools array of the Responses request. Never invent tool names.",
+			"Do not use code_interpreter, web_search, or any built-in tool unless that exact name appears in the request's tools array.",
+		)
+
+		normalizedChoice := strings.TrimSpace(toolChoice)
+		switch strings.ToLower(normalizedChoice) {
+		case "required":
+			lines = append(lines, "This request requires at least one tool call. Do not return a plain-text-only assistant response.")
+		case "", "auto":
+			// No additional constraint.
+		default:
+			lines = append(lines, fmt.Sprintf("This request requires the specific tool %q. Do not call any other tool and do not return a plain-text-only assistant response.", normalizedChoice))
+		}
+	}
+
+	lines = append(lines, "```json", requestJSON, "```")
+	return strings.Join(lines, "\n")
+}
+
 // BuildSimulatedPromptAnthropic constructs the prompt sent to M365 Copilot in
 // simulated mode for Anthropic Messages API clients. It embeds the full
 // Anthropic /v1/messages request JSON and instructs the model to return a
