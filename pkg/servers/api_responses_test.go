@@ -139,75 +139,6 @@ func TestParseResponsesSimulationRequiredRejectsPlainContent(t *testing.T) {
 	}
 }
 
-func TestParseResponsesSimulationWithRetryAcceptsRequiredToolCall(t *testing.T) {
-	policy, err := newResponsesToolPolicy(
-		responsesTestTools(),
-		map[string]interface{}{"type": "function", "name": "read_nonce"},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := "```json\n" +
-		`{"choices":[{"message":{"role":"assistant","content":"No tool."},"finish_reason":"stop"}]}` +
-		"\n```"
-	retries := 0
-
-	result, err := parseResponsesSimulationWithRetry(
-		first,
-		policy,
-		func() (string, error) {
-			retries++
-			return simulatedToolCallEnvelope("read_nonce"), nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("required tool retry failed: %v", err)
-	}
-	if retries != 1 {
-		t.Fatalf("retry count = %d, want 1", retries)
-	}
-	if len(result.toolCalls) != 1 ||
-		result.toolCalls[0].Function.Name != "read_nonce" {
-		t.Fatalf("unexpected retried tool calls: %#v", result.toolCalls)
-	}
-}
-
-func TestParseResponsesSimulationWithRetryAllowsSecondRetry(t *testing.T) {
-	policy, err := newResponsesToolPolicy(
-		responsesTestTools(),
-		map[string]interface{}{"type": "function", "name": "read_nonce"},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalid := "```json\n" +
-		`{"choices":[{"message":{"role":"assistant","content":"No tool."},"finish_reason":"stop"}]}` +
-		"\n```"
-	retries := 0
-
-	result, err := parseResponsesSimulationWithRetry(
-		invalid,
-		policy,
-		func() (string, error) {
-			retries++
-			if retries == 1 {
-				return invalid, nil
-			}
-			return simulatedToolCallEnvelope("read_nonce"), nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("second required tool retry failed: %v", err)
-	}
-	if retries != 2 {
-		t.Fatalf("retry count = %d, want 2", retries)
-	}
-	if len(result.toolCalls) != 1 ||
-		result.toolCalls[0].Function.Name != "read_nonce" {
-		t.Fatalf("unexpected second-retry tool calls: %#v", result.toolCalls)
-	}
-}
-
 func TestParseResponsesSimulationNamedRejectsWrongDeclaredTool(t *testing.T) {
 	policy, err := newResponsesToolPolicy(
 		responsesTestTools(),
@@ -251,93 +182,6 @@ func TestParseResponsesSimulationAcceptsFlatResponsesToolDefinition(t *testing.T
 	}
 	if len(result.toolCalls) != 1 || result.toolCalls[0].Function.Name != "read_nonce" {
 		t.Fatalf("unexpected parsed tool calls: %#v", result.toolCalls)
-	}
-}
-
-func TestParseResponsesSimulationPreservesToolPreamble(t *testing.T) {
-	policy, err := newResponsesToolPolicy(responsesTestTools(), "required")
-	if err != nil {
-		t.Fatal(err)
-	}
-	const preamble = "Önce nonce dosyasını okuyup sonucu doğrulayacağım."
-	raw := "```json\n" +
-		`{"choices":[{"message":{"role":"assistant","content":"` +
-		preamble +
-		`","tool_calls":[{"id":"call_test","type":"function","function":{"name":"read_nonce","arguments":"{\"path\":\"nonce.txt\"}"}}]},"finish_reason":"tool_calls"}]}` +
-		"\n```"
-
-	result, err := parseResponsesSimulation(raw, policy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.content != preamble {
-		t.Fatalf("tool preamble = %q, want %q", result.content, preamble)
-	}
-	if len(result.toolCalls) != 1 {
-		t.Fatalf("tool call count = %d, want 1", len(result.toolCalls))
-	}
-}
-
-func TestParseResponsesSimulationAddsSafeFallbackPreamble(t *testing.T) {
-	policy, err := newResponsesToolPolicy(responsesTestTools(), "required")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result, err := parseResponsesSimulation(
-		simulatedToolCallEnvelope("read_nonce"),
-		policy,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.TrimSpace(result.content) == "" {
-		t.Fatal("tool call without model content did not receive a visible fallback preamble")
-	}
-	for _, forbidden := range []string{"chatcmpl-", `"choices"`, `"tool_calls"`} {
-		if strings.Contains(result.content, forbidden) {
-			t.Fatalf("fallback preamble leaked transport marker %q: %q", forbidden, result.content)
-		}
-	}
-}
-
-func TestBuildResponsesObjectPlacesCommentaryBeforeToolCall(t *testing.T) {
-	call := client.ToolCall{
-		ID:   "call_read",
-		Type: "function",
-		Function: client.ToolCallFunction{
-			Name:      "read_nonce",
-			Arguments: `{"path":"nonce.txt"}`,
-		},
-	}
-
-	response := buildResponsesObject(
-		"resp_test",
-		"gpt-test",
-		"Nonce dosyasını şimdi okuyorum.",
-		"",
-		[]client.ToolCall{call},
-		map[string]string{"read_nonce": "function"},
-		"tool_calls",
-		1,
-		1,
-		0,
-	)
-	output, ok := response["output"].([]map[string]interface{})
-	if !ok {
-		t.Fatalf("response output has unexpected type: %T", response["output"])
-	}
-	if len(output) != 2 {
-		t.Fatalf("output item count = %d, want 2: %#v", len(output), output)
-	}
-	if output[0]["type"] != "message" {
-		t.Fatalf("first output item type = %#v, want message", output[0]["type"])
-	}
-	if output[0]["phase"] != "commentary" {
-		t.Fatalf("tool preamble phase = %#v, want commentary", output[0]["phase"])
-	}
-	if output[1]["type"] != "function_call" {
-		t.Fatalf("second output item type = %#v, want function_call", output[1]["type"])
 	}
 }
 
@@ -392,28 +236,6 @@ func TestBuildResponsesToolCallItemIncludesNamespace(t *testing.T) {
 	}
 	if item["name"] != "js" {
 		t.Fatalf("function_call name = %#v", item["name"])
-	}
-}
-
-func TestBuildResponsesToolCallItemIncludesEmptyArgumentsWhileInProgress(t *testing.T) {
-	call := client.ToolCall{
-		ID:   "call_read",
-		Type: "function",
-		Function: client.ToolCallFunction{
-			Name:      "read_nonce",
-			Arguments: `{"path":"nonce.txt"}`,
-		},
-	}
-
-	item := buildResponsesToolCallItem(
-		"call_read",
-		call,
-		map[string]string{"read_nonce": "function"},
-		"in_progress",
-	)
-
-	if arguments, ok := item["arguments"]; !ok || arguments != "" {
-		t.Fatalf("in-progress arguments = %#v, want empty string", arguments)
 	}
 }
 
@@ -548,35 +370,6 @@ func TestResponsesInputPreservesToolSearchAndCompactionHistory(t *testing.T) {
 	} {
 		if !strings.Contains(combined, expected) {
 			t.Fatalf("Responses history lost %q: %#v", expected, messages)
-		}
-	}
-}
-
-func TestResponsesFunctionCallOutputBecomesAuthoritativeToolHistory(t *testing.T) {
-	messages := responsesInputToMessages([]interface{}{
-		map[string]interface{}{
-			"type":    "function_call_output",
-			"call_id": "call_nonce",
-			"output":  "NONCE-EXACT",
-		},
-	})
-
-	if len(messages) != 1 {
-		t.Fatalf("message count = %d", len(messages))
-	}
-	if messages[0].Role != "tool" {
-		t.Fatalf("function result role = %q, want tool", messages[0].Role)
-	}
-	if messages[0].ToolCallID != "call_nonce" {
-		t.Fatalf("function result call id = %q, want call_nonce", messages[0].ToolCallID)
-	}
-	for _, expected := range []string{
-		"authoritative tool result",
-		"call_nonce",
-		"NONCE-EXACT",
-	} {
-		if !strings.Contains(strings.ToLower(messages[0].Content), strings.ToLower(expected)) {
-			t.Fatalf("function result lost %q: %s", expected, messages[0].Content)
 		}
 	}
 }
@@ -780,68 +573,6 @@ func TestWriteResponsesSimulationErrorStreaming(t *testing.T) {
 		t.Fatalf("stream missing response.failed event:\n%s", body)
 	}
 	if !strings.Contains(body, `"code":"`+simulatedToolCallRequiredCode+`"`) {
-		t.Fatalf("stream missing stable error code:\n%s", body)
-	}
-	if !strings.Contains(body, "data: [DONE]") {
-		t.Fatalf("stream missing terminal marker:\n%s", body)
-	}
-}
-
-func TestResponsesResultRequiresVisibleOutput(t *testing.T) {
-	call := client.ToolCall{ID: "call_test"}
-	tests := []struct {
-		name  string
-		text  string
-		calls []client.ToolCall
-		empty bool
-	}{
-		{name: "empty", empty: true},
-		{name: "content", text: "ok"},
-		{name: "tool call", calls: []client.ToolCall{call}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := responsesResultEmpty(tt.text, tt.calls); got != tt.empty {
-				t.Fatalf("responsesResultEmpty = %v, want %v", got, tt.empty)
-			}
-		})
-	}
-}
-
-func TestWriteResponsesUpstreamEmptyErrorNonStreaming(t *testing.T) {
-	rec := httptest.NewRecorder()
-
-	writeResponsesUpstreamEmptyError(rec, false, "resp_test", "gpt-test")
-
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
-	}
-	var body map[string]interface{}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("invalid JSON body: %v", err)
-	}
-	errorObject, _ := body["error"].(map[string]interface{})
-	if errorObject["code"] != upstreamEmptyResponseCode {
-		t.Fatalf("error code = %#v, want %q", errorObject["code"], upstreamEmptyResponseCode)
-	}
-	if message, _ := errorObject["message"].(string); strings.Contains(
-		strings.ToLower(message),
-		"throttl",
-	) {
-		t.Fatalf("empty response error speculates about throttling: %q", message)
-	}
-}
-
-func TestWriteResponsesUpstreamEmptyErrorStreaming(t *testing.T) {
-	rec := httptest.NewRecorder()
-
-	writeResponsesUpstreamEmptyError(rec, true, "resp_test", "gpt-test")
-
-	body := rec.Body.String()
-	if !strings.Contains(body, `"type":"response.failed"`) {
-		t.Fatalf("stream missing response.failed event:\n%s", body)
-	}
-	if !strings.Contains(body, `"code":"`+upstreamEmptyResponseCode+`"`) {
 		t.Fatalf("stream missing stable error code:\n%s", body)
 	}
 	if !strings.Contains(body, "data: [DONE]") {
