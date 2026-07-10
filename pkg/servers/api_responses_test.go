@@ -2,11 +2,14 @@ package servers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/toolcalling"
 )
@@ -93,6 +96,21 @@ func TestResponsesToolPolicyRejectsUnknownNamedTool(t *testing.T) {
 	}
 }
 
+func TestResponsesToolPolicyAcceptsBuiltInToolType(t *testing.T) {
+	tools := []toolcalling.ToolDef{{Type: "tool_search"}}
+
+	policy, err := newResponsesToolPolicy(
+		tools,
+		map[string]interface{}{"type": "tool_search"},
+	)
+	if err != nil {
+		t.Fatalf("built-in Responses tool rejected: %v", err)
+	}
+	if len(policy.allowedToolNames) != 1 || policy.allowedToolNames[0] != "tool_search" {
+		t.Fatalf("unexpected built-in allowlist: %#v", policy.allowedToolNames)
+	}
+}
+
 func TestParseResponsesSimulationRequiredRejectsPlainContent(t *testing.T) {
 	policy, err := newResponsesToolPolicy(responsesTestTools(), "required")
 	if err != nil {
@@ -151,6 +169,148 @@ func TestParseResponsesSimulationAcceptsFlatResponsesToolDefinition(t *testing.T
 	}
 	if len(result.toolCalls) != 1 || result.toolCalls[0].Function.Name != "read_nonce" {
 		t.Fatalf("unexpected parsed tool calls: %#v", result.toolCalls)
+	}
+}
+
+func TestBuildResponsesToolCallItemUsesDeclaredBuiltInType(t *testing.T) {
+	call := client.ToolCall{
+		ID:   "call_search",
+		Type: "function",
+		Function: client.ToolCallFunction{
+			Name:      "tool_search",
+			Arguments: `{"query":"node repl"}`,
+		},
+	}
+
+	item := buildResponsesToolCallItem(
+		"call_search",
+		call,
+		map[string]string{"tool_search": "tool_search"},
+		"completed",
+	)
+
+	if item["type"] != "tool_search_call" {
+		t.Fatalf("tool_search item type = %#v", item["type"])
+	}
+	if item["execution"] != "client" {
+		t.Fatalf("tool_search execution = %#v", item["execution"])
+	}
+	if _, ok := item["arguments"].(map[string]interface{}); !ok {
+		t.Fatalf("tool_search arguments are not a JSON object: %#v", item["arguments"])
+	}
+}
+
+func TestMergeLoadedResponsesTools(t *testing.T) {
+	input := []interface{}{
+		map[string]interface{}{
+			"type": "tool_search_output",
+			"tools": []interface{}{
+				map[string]interface{}{
+					"type": "namespace",
+					"tools": []interface{}{
+						map[string]interface{}{
+							"type": "function",
+							"name": "node_repl",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	tools := mergeLoadedResponsesTools(
+		input,
+		[]toolcalling.ToolDef{{Type: "tool_search"}},
+	)
+	names := responsesToolNames(tools)
+	if strings.Join(names, ",") != "tool_search,node_repl" {
+		t.Fatalf("loaded Responses tools not merged: %#v", names)
+	}
+}
+
+func TestResponsesInputPreservesToolSearchAndCompactionHistory(t *testing.T) {
+	input := []interface{}{
+		map[string]interface{}{
+			"type":      "tool_search_call",
+			"arguments": map[string]interface{}{"query": "node repl"},
+		},
+		map[string]interface{}{
+			"type": "tool_search_output",
+			"tools": []interface{}{
+				map[string]interface{}{
+					"type": "function",
+					"name": "node_repl",
+				},
+			},
+		},
+		map[string]interface{}{
+			"type":              "compaction",
+			"encrypted_content": "Earlier work summary",
+		},
+	}
+
+	messages := responsesInputToMessages(input)
+	combined := ""
+	for _, message := range messages {
+		combined += message.Content + "\n"
+	}
+	for _, expected := range []string{
+		"Tool search call",
+		"node_repl",
+		"Earlier work summary",
+	} {
+		if !strings.Contains(combined, expected) {
+			t.Fatalf("Responses history lost %q: %#v", expected, messages)
+		}
+	}
+}
+
+func TestContextCacheDeleteRemovesMemoryAndDisk(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewContextCache(cacheDir)
+	cache.Set("session:test", "conv-poisoned")
+	cache.Delete("session:test")
+
+	if got := cache.Get("session:test"); got != "" {
+		t.Fatalf("deleted context cache returned %q", got)
+	}
+	matches, err := filepath.Glob(filepath.Join(cacheDir, "*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("deleted context cache left disk entries: %#v", matches)
+	}
+}
+
+func TestShouldResetResponsesSession(t *testing.T) {
+	call := client.ToolCall{
+		Function: client.ToolCallFunction{Name: "read_nonce"},
+	}
+	tests := []struct {
+		name    string
+		content string
+		calls   []client.ToolCall
+		err     error
+		want    bool
+	}{
+		{name: "error", err: errors.New("failed"), want: true},
+		{name: "empty", want: true},
+		{name: "content", content: "ok", want: false},
+		{name: "tool call", calls: []client.ToolCall{call}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldResetResponsesSession(tt.content, tt.calls, tt.err); got != tt.want {
+				t.Fatalf("shouldResetResponsesSession = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResponsesCompactionAlwaysUsesFreshConversation(t *testing.T) {
+	if got := responsesCompactionConversationID("conv-poisoned"); got != "" {
+		t.Fatalf("compaction reused sticky conversation %q", got)
 	}
 }
 

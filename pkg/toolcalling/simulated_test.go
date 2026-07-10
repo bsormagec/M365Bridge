@@ -17,6 +17,7 @@ func TestBuildSimulatedPromptResponsesDescribesResponsesPayload(t *testing.T) {
 		`"instructions"`,
 		`"tools"`,
 		`"tool_choice"`,
+		"tool_search_output",
 		requestJSON,
 	} {
 		if !strings.Contains(prompt, want) {

@@ -102,6 +102,17 @@ func (cc *ContextCache) Set(key, convID string) {
 	os.WriteFile(cc.path(key), data, 0600)
 }
 
+// Delete removes a conversation ID from memory and disk.
+func (cc *ContextCache) Delete(key string) {
+	cc.mu.Lock()
+	delete(cc.mem, key)
+	if idx := indexOf(cc.order, key); idx >= 0 {
+		cc.order = append(cc.order[:idx], cc.order[idx+1:]...)
+	}
+	cc.mu.Unlock()
+	_ = os.Remove(cc.path(key))
+}
+
 // evict removes oldest entries when cache exceeds max size.
 func (cc *ContextCache) evict() {
 	for len(cc.order) > contextCacheMaxSize {
@@ -2054,6 +2065,7 @@ type responsesToolPolicy struct {
 	requiredName     string
 	promptChoice     string
 	allowedToolNames []string
+	tools            []toolcalling.ToolDef
 }
 
 type responsesSimulationResult struct {
@@ -2063,21 +2075,17 @@ type responsesSimulationResult struct {
 }
 
 func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice interface{}) (responsesToolPolicy, error) {
-	allNames := make([]string, 0, len(tools))
+	allNames := responsesToolNames(tools)
 	knownNames := make(map[string]bool, len(tools))
-	for i := range tools {
-		name := strings.TrimSpace(toolcalling.ToolName(&tools[i]))
-		if name == "" || knownNames[name] {
-			continue
-		}
+	for _, name := range allNames {
 		knownNames[name] = true
-		allNames = append(allNames, name)
 	}
 
 	policy := responsesToolPolicy{
 		simulate:         len(tools) > 0,
 		promptChoice:     "auto",
 		allowedToolNames: allNames,
+		tools:            tools,
 	}
 
 	switch choice := toolChoice.(type) {
@@ -2105,10 +2113,14 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice interface{})
 		}
 	case map[string]interface{}:
 		name, _ := choice["name"].(string)
+		choiceType, _ := choice["type"].(string)
 		if name == "" {
 			if function, ok := choice["function"].(map[string]interface{}); ok {
 				name, _ = function["name"].(string)
 			}
+		}
+		if name == "" && choiceType != "" && choiceType != "function" && choiceType != "custom" {
+			name = choiceType
 		}
 		name = strings.TrimSpace(name)
 		if name == "" || !knownNames[name] {
@@ -2129,6 +2141,137 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice interface{})
 		return responsesToolPolicy{}, errors.New("Responses tool_choice requires at least one tool")
 	}
 	return policy, nil
+}
+
+func responsesToolName(tool toolcalling.ToolDef) string {
+	name := strings.TrimSpace(toolcalling.ToolName(&tool))
+	if name == "" && tool.Type != "" && tool.Type != "function" && tool.Type != "custom" {
+		name = tool.Type
+	}
+	return name
+}
+
+func responsesToolNames(tools []toolcalling.ToolDef) []string {
+	names := make([]string, 0, len(tools))
+	seen := make(map[string]bool, len(tools))
+	for _, tool := range tools {
+		name := responsesToolName(tool)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	return names
+}
+
+func responsesToolTypes(tools []toolcalling.ToolDef) map[string]string {
+	types := make(map[string]string, len(tools))
+	for _, tool := range tools {
+		name := responsesToolName(tool)
+		if name == "" {
+			continue
+		}
+		toolType := tool.Type
+		if toolType == "" {
+			toolType = "function"
+		}
+		types[name] = toolType
+	}
+	return types
+}
+
+func responsesToolDefsFromRaw(raw interface{}) []toolcalling.ToolDef {
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	var definitions []toolcalling.ToolDef
+	for _, item := range items {
+		tool, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		toolType, _ := tool["type"].(string)
+		if toolType == "namespace" {
+			definitions = append(definitions, responsesToolDefsFromRaw(tool["tools"])...)
+			continue
+		}
+		name, _ := tool["name"].(string)
+		if name == "" && toolType != "" && toolType != "function" && toolType != "custom" {
+			name = toolType
+		}
+		if name == "" {
+			continue
+		}
+		definitions = append(definitions, toolcalling.ToolDef{
+			Type: toolType,
+			Name: name,
+		})
+	}
+	return definitions
+}
+
+func mergeLoadedResponsesTools(input interface{}, tools []toolcalling.ToolDef) []toolcalling.ToolDef {
+	items, ok := input.([]interface{})
+	if !ok {
+		return tools
+	}
+	seen := make(map[string]bool, len(tools))
+	for _, name := range responsesToolNames(tools) {
+		seen[name] = true
+	}
+	for _, item := range items {
+		record, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		itemType, _ := record["type"].(string)
+		if itemType != "tool_search_output" && itemType != "additional_tools" {
+			continue
+		}
+		for _, tool := range responsesToolDefsFromRaw(record["tools"]) {
+			name := responsesToolName(tool)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			tools = append(tools, tool)
+		}
+	}
+	return tools
+}
+
+func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes map[string]string, status string) map[string]interface{} {
+	if toolTypes[call.Function.Name] == "tool_search" {
+		var arguments interface{}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &arguments); err != nil || arguments == nil {
+			arguments = map[string]interface{}{"query": call.Function.Arguments}
+		}
+		return map[string]interface{}{
+			"id":        callID,
+			"type":      "tool_search_call",
+			"execution": "client",
+			"status":    status,
+			"call_id":   callID,
+			"arguments": arguments,
+		}
+	}
+	item := map[string]interface{}{
+		"id":      callID,
+		"type":    "function_call",
+		"status":  status,
+		"call_id": callID,
+		"name":    call.Function.Name,
+	}
+	if status == "completed" {
+		item["arguments"] = call.Function.Arguments
+	}
+	return item
+}
+
+func shouldResetResponsesSession(content string, toolCalls []client.ToolCall, err error) bool {
+	return err != nil || (strings.TrimSpace(content) == "" && len(toolCalls) == 0)
 }
 
 func parseResponsesSimulation(text string, policy responsesToolPolicy) (responsesSimulationResult, error) {
@@ -2355,6 +2498,7 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.Tools = mergeLoadedResponsesTools(req.Input, req.Tools)
 	toolPolicy, err := newResponsesToolPolicy(req.Tools, req.ToolChoice)
 	if err != nil {
 		api.sendError(w, http.StatusBadRequest, err.Error())
@@ -2468,6 +2612,39 @@ func responsesInputToMessages(input interface{}) []payload.Message {
 			continue
 		}
 
+		if itemType == "tool_search_call" {
+			arguments, _ := json.Marshal(m["arguments"])
+			messages = append(messages, payload.Message{
+				Role:    "assistant",
+				Content: fmt.Sprintf("Tool search call: tool_search(%s)", string(arguments)),
+			})
+			continue
+		}
+
+		if itemType == "tool_search_output" {
+			names := responsesToolNames(responsesToolDefsFromRaw(m["tools"]))
+			messages = append(messages, payload.Message{
+				Role:    "tool",
+				Content: "Tool search result: loaded tools are callable by name: " + strings.Join(names, ", "),
+			})
+			continue
+		}
+
+		if itemType == "additional_tools" {
+			continue
+		}
+
+		if itemType == "compaction" {
+			summary, _ := m["encrypted_content"].(string)
+			if strings.TrimSpace(summary) != "" {
+				messages = append(messages, payload.Message{
+					Role:    "user",
+					Content: "Summary of the earlier conversation:\n" + summary,
+				})
+			}
+			continue
+		}
+
 		// Message items (type "message" or items with role)
 		role, _ := m["role"].(string)
 		if role == "" {
@@ -2517,7 +2694,7 @@ func responsesExtractContent(content interface{}) string {
 }
 
 // buildResponsesObject constructs the non-streaming Responses API response object.
-func buildResponsesObject(responseID, model, text, thinking string, toolCalls []client.ToolCall, finishReason string, promptTok, completionTok, reasoningTok int) map[string]interface{} {
+func buildResponsesObject(responseID, model, text, thinking string, toolCalls []client.ToolCall, toolTypes map[string]string, finishReason string, promptTok, completionTok, reasoningTok int) map[string]interface{} {
 	status := "completed"
 	if finishReason == "length" {
 		status = "incomplete"
@@ -2543,20 +2720,13 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 		outputIndex++
 	}
 
-	// Add function_call items for tool calls
+	// Add function_call or built-in client tool items.
 	for i, tc := range toolCalls {
 		callID := tc.ID
 		if callID == "" {
 			callID = fmt.Sprintf("call_%d", i)
 		}
-		output = append(output, map[string]interface{}{
-			"id":        callID,
-			"type":      "function_call",
-			"status":    "completed",
-			"call_id":   callID,
-			"name":      tc.Function.Name,
-			"arguments": tc.Function.Arguments,
-		})
+		output = append(output, buildResponsesToolCallItem(callID, tc, toolTypes, "completed"))
 		outputIndex++
 	}
 
@@ -2601,6 +2771,9 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, toolPolicy responsesToolPolicy) {
 	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, toolPolicy.simulate)
 	if err != nil {
+		if sid != "" {
+			api.ctxCache.Delete("session:" + sid)
+		}
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
 	}
@@ -2614,6 +2787,9 @@ func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []paylo
 	if toolPolicy.simulate {
 		simulated, parseErr := parseResponsesSimulation(respText, toolPolicy)
 		if parseErr != nil {
+			if sid != "" {
+				api.ctxCache.Delete("session:" + sid)
+			}
 			writeResponsesSimulationError(w, false, "", cfg.OpenAIID, parseErr)
 			return
 		}
@@ -2637,13 +2813,15 @@ func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []paylo
 	reasoningTok := countTokens(thinking)
 
 	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
-	response := buildResponsesObject(responseID, cfg.OpenAIID, respText, thinking, toolCalls, finishReason, promptTok, completionTok, reasoningTok)
+	response := buildResponsesObject(responseID, cfg.OpenAIID, respText, thinking, toolCalls, responsesToolTypes(toolPolicy.tools), finishReason, promptTok, completionTok, reasoningTok)
 
 	api.sendJSON(w, http.StatusOK, response)
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if finalConvID != "" {
+		if shouldResetResponsesSession(respText, toolCalls, nil) {
+			api.ctxCache.Delete("session:" + sid)
+		} else if finalConvID != "" {
 			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
@@ -2701,10 +2879,13 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 
 	// When tool calling is enabled, buffer all text and parse at the end
 	toolCallingEnabled := toolPolicy.simulate
+	streamSimulatedContent := toolCallingEnabled && !toolPolicy.required
+	var contentExtractor toolcalling.ContentStreamExtractor
 
 	// Track whether we've emitted the message output item
 	messageItemEmitted := false
 	reasoningItemEmitted := false
+	messageOutputIndex := 0
 	msgID := fmt.Sprintf("msg_%s", responseID)
 	reasoningID := fmt.Sprintf("rs_%s", responseID)
 
@@ -2712,6 +2893,9 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
+			if sid != "" {
+				api.ctxCache.Delete("session:" + sid)
+			}
 			sendEvent("response.failed", map[string]interface{}{
 				"response": map[string]interface{}{
 					"id":     responseID,
@@ -2767,6 +2951,43 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 			if toolCallingEnabled {
 				// Buffer text for tool call parsing at the end
 				fullText += chunk.Text
+				if streamSimulatedContent {
+					delta := contentExtractor.Feed(chunk.Text)
+					if delta != "" {
+						if !messageItemEmitted {
+							if reasoningItemEmitted {
+								messageOutputIndex = 1
+							}
+							sendEvent("response.output_item.added", map[string]interface{}{
+								"output_index": messageOutputIndex,
+								"item": map[string]interface{}{
+									"id":      msgID,
+									"type":    "message",
+									"status":  "in_progress",
+									"role":    "assistant",
+									"content": []interface{}{},
+								},
+							})
+							sendEvent("response.content_part.added", map[string]interface{}{
+								"item_id":       msgID,
+								"output_index":  messageOutputIndex,
+								"content_index": 0,
+								"part": map[string]interface{}{
+									"type":        "output_text",
+									"text":        "",
+									"annotations": []interface{}{},
+								},
+							})
+							messageItemEmitted = true
+						}
+						sendEvent("response.output_text.delta", map[string]interface{}{
+							"item_id":       msgID,
+							"output_index":  messageOutputIndex,
+							"content_index": 0,
+							"delta":         delta,
+						})
+					}
+				}
 			} else {
 				if !messageItemEmitted {
 					// Emit message output item
@@ -2871,10 +3092,17 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	if toolCallingEnabled {
 		simulated, parseErr := parseResponsesSimulation(fullText, toolPolicy)
 		if parseErr != nil {
+			if sid != "" {
+				api.ctxCache.Delete("session:" + sid)
+			}
 			writeResponsesSimulationError(w, true, responseID, openaiModel, parseErr)
 			return
 		}
-		fullText = simulated.content
+		if messageItemEmitted {
+			fullText = contentExtractor.Text()
+		} else {
+			fullText = simulated.content
+		}
 		toolCalls = simulated.toolCalls
 		finishReason = simulated.finishReason
 
@@ -2883,49 +3111,76 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 		if reasoningItemEmitted {
 			outputIdx = 1
 		}
+		if messageItemEmitted {
+			outputIdx = messageOutputIndex + 1
+		}
 
 		// Emit tool call items
+		toolTypes := responsesToolTypes(toolPolicy.tools)
 		for i, tc := range toolCalls {
 			callID := tc.ID
 			if callID == "" {
 				callID = fmt.Sprintf("call_%d", i)
 			}
+			isToolSearch := toolTypes[tc.Function.Name] == "tool_search"
 			sendEvent("response.output_item.added", map[string]interface{}{
 				"output_index": outputIdx,
-				"item": map[string]interface{}{
-					"id":      callID,
-					"type":    "function_call",
-					"status":  "in_progress",
-					"call_id": callID,
-					"name":    tc.Function.Name,
-				},
+				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
 			})
-			sendEvent("response.function_call_arguments.delta", map[string]interface{}{
-				"item_id":      callID,
-				"output_index": outputIdx,
-				"delta":        tc.Function.Arguments,
-			})
-			sendEvent("response.function_call_arguments.done", map[string]interface{}{
-				"item_id":      callID,
-				"output_index": outputIdx,
-				"arguments":    tc.Function.Arguments,
-			})
+			if !isToolSearch {
+				sendEvent("response.function_call_arguments.delta", map[string]interface{}{
+					"item_id":      callID,
+					"output_index": outputIdx,
+					"delta":        tc.Function.Arguments,
+				})
+				sendEvent("response.function_call_arguments.done", map[string]interface{}{
+					"item_id":      callID,
+					"output_index": outputIdx,
+					"arguments":    tc.Function.Arguments,
+				})
+			}
 			sendEvent("response.output_item.done", map[string]interface{}{
 				"output_index": outputIdx,
-				"item": map[string]interface{}{
-					"id":        callID,
-					"type":      "function_call",
-					"status":    "completed",
-					"call_id":   callID,
-					"name":      tc.Function.Name,
-					"arguments": tc.Function.Arguments,
-				},
+				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "completed"),
 			})
 			outputIdx++
 		}
 
-		// Emit text message item if there's text
-		if fullText != "" || len(toolCalls) == 0 {
+		if messageItemEmitted {
+			sendEvent("response.output_text.done", map[string]interface{}{
+				"item_id":       msgID,
+				"output_index":  messageOutputIndex,
+				"content_index": 0,
+				"text":          fullText,
+			})
+			sendEvent("response.content_part.done", map[string]interface{}{
+				"item_id":       msgID,
+				"output_index":  messageOutputIndex,
+				"content_index": 0,
+				"part": map[string]interface{}{
+					"type":        "output_text",
+					"text":        fullText,
+					"annotations": []interface{}{},
+				},
+			})
+			sendEvent("response.output_item.done", map[string]interface{}{
+				"output_index": messageOutputIndex,
+				"item": map[string]interface{}{
+					"id":     msgID,
+					"type":   "message",
+					"status": "completed",
+					"role":   "assistant",
+					"content": []map[string]interface{}{
+						{
+							"type":        "output_text",
+							"text":        fullText,
+							"annotations": []interface{}{},
+						},
+					},
+				},
+			})
+		} else if fullText != "" || len(toolCalls) == 0 {
+			// Emit buffered text when no incremental content was available.
 			// Enforce max_output_tokens
 			if maxTokens > 0 {
 				if truncated, ok := truncateToTokens(fullText, maxTokens); ok {
@@ -3049,7 +3304,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	completionTok := countTokens(fullText)
 	reasoningTok := countTokens(thinkingText)
 
-	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, thinkingText, toolCalls, finishReason, promptTok, completionTok, reasoningTok)
+	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, thinkingText, toolCalls, responsesToolTypes(toolPolicy.tools), finishReason, promptTok, completionTok, reasoningTok)
 	finalResponse["status"] = status
 
 	sendEvent("response.completed", map[string]interface{}{
@@ -3061,7 +3316,9 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if finalConvID != "" {
+		if shouldResetResponsesSession(fullText, toolCalls, nil) {
+			api.ctxCache.Delete("session:" + sid)
+		} else if finalConvID != "" {
 			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
@@ -3075,6 +3332,10 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 // compacting a conversation. It asks the model to produce a concise summary
 // that preserves key context for continuation.
 const defaultCompactionPrompt = "I need a concise summary of the following conversation between a user and an assistant. Please cover the main topics discussed, any decisions made, code or files mentioned, and what was being worked on. Keep it brief but preserve all important context."
+
+func responsesCompactionConversationID(string) string {
+	return ""
+}
 
 // handleResponsesCompact handles POST /v1/responses/compact requests from Codex.
 // It sends the conversation history to M365 Copilot with a compaction prompt,
@@ -3153,10 +3414,9 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 		sid = api.hashSessionIDFromMessages(r, messages)
 	}
 
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get("session:" + sid)
-	}
+	convID := responsesCompactionConversationID(
+		api.ctxCache.Get("session:" + sid),
+	)
 
 	// Upload any images found in multimodal content
 	api.uploadImagesAndAnnotate(&messages, convID)
@@ -3202,9 +3462,12 @@ func buildCompactionResponseObject(responseID, model, summaryText string, prompt
 
 // nonStreamResponsesCompact handles non-streaming compact requests.
 func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	respText, _, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		logging.Errorf("nonStreamResponsesCompact: chat failed: %v", err)
+		if sid != "" {
+			api.ctxCache.Delete("session:" + sid)
+		}
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Compaction failed: %v", err))
 		return
 	}
@@ -3233,11 +3496,8 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 
 	api.sendJSON(w, http.StatusOK, response)
 
-	// Cache conversation ID for session continuity
-	if sid != "" {
-		if finalConvID != "" {
-			api.ctxCache.Set("session:"+sid, finalConvID)
-		}
+	if sid != "" && strings.TrimSpace(respText) != "" {
+		api.ctxCache.Delete("session:" + sid)
 	}
 }
 
@@ -3291,11 +3551,13 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 
 	fullText := ""
 
-	var finalConvID string
 	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			logging.Errorf("streamResponsesCompact: stream error: %v", chunk.Error)
+			if sid != "" {
+				api.ctxCache.Delete("session:" + sid)
+			}
 			sendEvent("response.failed", map[string]interface{}{
 				"response": map[string]interface{}{
 					"id":     responseID,
@@ -3362,11 +3624,8 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 
-	// Cache conversation ID for session continuity
-	if sid != "" {
-		if finalConvID != "" {
-			api.ctxCache.Set("session:"+sid, finalConvID)
-		}
+	if sid != "" && strings.TrimSpace(fullText) != "" {
+		api.ctxCache.Delete("session:" + sid)
 	}
 }
 
