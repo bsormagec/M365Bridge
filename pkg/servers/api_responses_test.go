@@ -5,9 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
@@ -111,6 +113,17 @@ func TestResponsesToolPolicyAcceptsBuiltInToolType(t *testing.T) {
 	}
 }
 
+func TestToolNamesFromDefsIncludesFlatAndBuiltInTools(t *testing.T) {
+	tools := []toolcalling.ToolDef{
+		{Name: "anthropic_tool"},
+		{Type: "tool_search"},
+	}
+
+	if got := strings.Join(toolNamesFromDefs(tools), ","); got != "anthropic_tool,tool_search" {
+		t.Fatalf("flat tool allowlist = %q", got)
+	}
+}
+
 func TestParseResponsesSimulationRequiredRejectsPlainContent(t *testing.T) {
 	policy, err := newResponsesToolPolicy(responsesTestTools(), "required")
 	if err != nil {
@@ -200,6 +213,32 @@ func TestBuildResponsesToolCallItemUsesDeclaredBuiltInType(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesToolCallItemIncludesNamespace(t *testing.T) {
+	call := client.ToolCall{
+		ID:   "call_js",
+		Type: "function",
+		Function: client.ToolCallFunction{
+			Name:      "js",
+			Namespace: "mcp__node_repl",
+			Arguments: `{"code":"1+1"}`,
+		},
+	}
+
+	item := buildResponsesToolCallItem(
+		"call_js",
+		call,
+		map[string]string{"mcp__node_repl/js": "function"},
+		"completed",
+	)
+
+	if item["namespace"] != "mcp__node_repl" {
+		t.Fatalf("function_call namespace = %#v", item["namespace"])
+	}
+	if item["name"] != "js" {
+		t.Fatalf("function_call name = %#v", item["name"])
+	}
+}
+
 func TestMergeLoadedResponsesTools(t *testing.T) {
 	input := []interface{}{
 		map[string]interface{}{
@@ -225,6 +264,76 @@ func TestMergeLoadedResponsesTools(t *testing.T) {
 	names := responsesToolNames(tools)
 	if strings.Join(names, ",") != "tool_search,node_repl" {
 		t.Fatalf("loaded Responses tools not merged: %#v", names)
+	}
+}
+
+func TestMergeLoadedResponsesToolsPreservesDuplicateNamespacedTools(t *testing.T) {
+	input := []interface{}{
+		map[string]interface{}{
+			"type": "tool_search_output",
+			"tools": []interface{}{
+				map[string]interface{}{
+					"type": "namespace",
+					"name": "mcp__node_repl",
+					"tools": []interface{}{
+						map[string]interface{}{"type": "function", "name": "js"},
+					},
+				},
+				map[string]interface{}{
+					"type": "namespace",
+					"name": "mcp__browser",
+					"tools": []interface{}{
+						map[string]interface{}{"type": "function", "name": "js"},
+					},
+				},
+			},
+		},
+	}
+
+	tools := mergeLoadedResponsesTools(input, nil)
+	if len(tools) != 2 {
+		t.Fatalf("namespaced duplicate tools collapsed: %#v", tools)
+	}
+	if tools[0].Namespace != "mcp__node_repl" || tools[1].Namespace != "mcp__browser" {
+		t.Fatalf("loaded namespaces not preserved: %#v", tools)
+	}
+}
+
+func TestParseResponsesSimulationPreservesNamespace(t *testing.T) {
+	tools := []toolcalling.ToolDef{
+		{Type: "function", Name: "js", Namespace: "mcp__node_repl"},
+	}
+	policy, err := newResponsesToolPolicy(tools, "required")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_js","name":"js","namespace":"mcp__node_repl","arguments":"{\"code\":\"1+1\"}"}]},"finish_reason":"tool_calls"}]}`
+
+	result, err := parseResponsesSimulation(raw, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.toolCalls) != 1 {
+		t.Fatalf("tool call count = %d", len(result.toolCalls))
+	}
+	if result.toolCalls[0].Function.Namespace != "mcp__node_repl" {
+		t.Fatalf("namespace = %q", result.toolCalls[0].Function.Namespace)
+	}
+}
+
+func TestParseResponsesSimulationRejectsAmbiguousUnqualifiedNamespace(t *testing.T) {
+	tools := []toolcalling.ToolDef{
+		{Type: "function", Name: "js", Namespace: "mcp__node_repl"},
+		{Type: "function", Name: "js", Namespace: "mcp__browser"},
+	}
+	policy, err := newResponsesToolPolicy(tools, "required")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_js","name":"js","arguments":"{}"}]},"finish_reason":"tool_calls"}]}`
+
+	if _, err := parseResponsesSimulation(raw, policy); err == nil {
+		t.Fatal("ambiguous unqualified namespaced tool call was accepted")
 	}
 }
 
@@ -265,6 +374,77 @@ func TestResponsesInputPreservesToolSearchAndCompactionHistory(t *testing.T) {
 	}
 }
 
+func TestResponsesInputPreservesNamespacedToolState(t *testing.T) {
+	namespacedTools := []interface{}{
+		map[string]interface{}{
+			"type": "namespace",
+			"name": "mcp__node_repl",
+			"tools": []interface{}{
+				map[string]interface{}{
+					"type": "function",
+					"name": "js",
+					"parameters": map[string]interface{}{
+						"type": "object",
+					},
+				},
+			},
+		},
+	}
+	input := []interface{}{
+		map[string]interface{}{
+			"type":  "tool_search_output",
+			"tools": namespacedTools,
+		},
+		map[string]interface{}{
+			"type":  "additional_tools",
+			"tools": namespacedTools,
+		},
+		map[string]interface{}{
+			"type":      "function_call",
+			"namespace": "mcp__node_repl",
+			"name":      "js",
+			"arguments": `{"code":"1+1"}`,
+		},
+		map[string]interface{}{
+			"type":    "function_call_output",
+			"call_id": "call_js",
+			"output":  "2",
+		},
+	}
+
+	messages := responsesInputToMessages(input)
+	combined := ""
+	for _, message := range messages {
+		combined += message.Content + "\n"
+	}
+	for _, expected := range []string{
+		"tool_search_output",
+		"additional_tools",
+		`"name":"mcp__node_repl"`,
+		`"name":"js"`,
+		`"parameters":{"type":"object"}`,
+		"mcp__node_repl/js",
+		"2",
+	} {
+		if !strings.Contains(combined, expected) {
+			t.Fatalf("Responses tool state lost %q:\n%s", expected, combined)
+		}
+	}
+}
+
+func TestDefaultCompactionPromptPreservesExactToolState(t *testing.T) {
+	for _, expected := range []string{
+		"tool state",
+		"exact names",
+		"namespace",
+		"results",
+	} {
+		if !strings.Contains(strings.ToLower(defaultCompactionPrompt), expected) {
+			t.Fatalf("default compaction prompt missing %q: %s", expected, defaultCompactionPrompt)
+		}
+	}
+}
+
 func TestContextCacheDeleteRemovesMemoryAndDisk(t *testing.T) {
 	cacheDir := t.TempDir()
 	cache := NewContextCache(cacheDir)
@@ -280,6 +460,46 @@ func TestContextCacheDeleteRemovesMemoryAndDisk(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("deleted context cache left disk entries: %#v", matches)
+	}
+}
+
+func TestContextCacheDeleteWinsAgainstInFlightSet(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewContextCache(cacheDir)
+	writeStarted := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	cache.writeFile = func(path string, data []byte, mode os.FileMode) error {
+		close(writeStarted)
+		<-releaseWrite
+		return os.WriteFile(path, data, mode)
+	}
+
+	setDone := make(chan struct{})
+	go func() {
+		defer close(setDone)
+		cache.Set("session:test", "conv-poisoned")
+	}()
+	<-writeStarted
+
+	deleteDone := make(chan struct{})
+	go func() {
+		defer close(deleteDone)
+		cache.Delete("session:test")
+	}()
+
+	select {
+	case <-deleteDone:
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseWrite)
+	<-setDone
+	<-deleteDone
+
+	if got := cache.Get("session:test"); got != "" {
+		t.Fatalf("late Set resurrected deleted context %q", got)
+	}
+	if _, err := os.Stat(cache.path("session:test")); !os.IsNotExist(err) {
+		t.Fatalf("late Set recreated deleted cache file: %v", err)
 	}
 }
 

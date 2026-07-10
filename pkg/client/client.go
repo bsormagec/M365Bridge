@@ -52,6 +52,7 @@ type ToolCall struct {
 // ToolCallFunction represents the function part of a tool call.
 type ToolCallFunction struct {
 	Name      string `json:"name"`
+	Namespace string `json:"namespace,omitempty"`
 	Arguments string `json:"arguments"`
 }
 

@@ -18,8 +18,9 @@ import (
 
 // ToolDef represents a tool definition from the client request.
 type ToolDef struct {
-	Type     string      `json:"type"`
-	Function ToolDefFunc `json:"function"`
+	Type      string      `json:"type"`
+	Namespace string      `json:"namespace,omitempty"`
+	Function  ToolDefFunc `json:"function"`
 	// Anthropic-style fields (flat, no "function" wrapper)
 	Name        string         `json:"name,omitempty"`
 	Description string         `json:"description,omitempty"`
@@ -37,6 +38,7 @@ type ToolDefFunc struct {
 type ToolCall struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
+	Namespace string          `json:"namespace,omitempty"`
 	Arguments json.RawMessage `json:"arguments"`
 }
 

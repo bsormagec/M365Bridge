@@ -37,6 +37,7 @@ func TestBuildSimulatedPromptResponsesKeepsChatCompletionResultEnvelope(t *testi
 		`choices[0].finish_reason`,
 		"function.arguments must be a JSON string",
 		"requires at least one tool call",
+		"namespace",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("Responses prompt missing result-envelope instruction %q:\n%s", want, prompt)
@@ -56,5 +57,91 @@ func TestExistingSimulatedPromptContractsRemainUnchanged(t *testing.T) {
 	}
 	if strings.Contains(anthropicPrompt, "POST /v1/responses") {
 		t.Fatalf("Anthropic prompt was changed to Responses semantics:\n%s", anthropicPrompt)
+	}
+}
+
+func TestParseSimulatedResponseDropsInventedFlatToolAndKeepsSafeContent(t *testing.T) {
+	raw := `{
+		"choices": [{
+			"message": {
+				"role": "assistant",
+				"content": "Safe plain response",
+				"tool_calls": [{
+					"id": "call_invented",
+					"name": "code_interpreter",
+					"arguments": "{}"
+				}]
+			},
+			"finish_reason": "tool_calls"
+		}]
+	}`
+
+	result := ParseSimulatedResponse(raw, []string{"safe_tool"})
+
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("invented tool calls were not filtered: %#v", result.ToolCalls)
+	}
+	if result.Content != "Safe plain response" {
+		t.Fatalf("safe content = %q, want %q", result.Content, "Safe plain response")
+	}
+	if result.FinishReason != "stop" {
+		t.Fatalf("finish reason = %q, want stop after filtering all tool calls", result.FinishReason)
+	}
+}
+
+func TestParseSimulatedResponseAnthropicDropsInventedToolAndKeepsSafeText(t *testing.T) {
+	raw := `{
+		"type": "message",
+		"role": "assistant",
+		"content": [
+			{"type": "text", "text": "Safe Anthropic response"},
+			{
+				"type": "tool_use",
+				"id": "toolu_invented",
+				"name": "code_interpreter",
+				"input": {}
+			}
+		],
+		"stop_reason": "tool_use"
+	}`
+
+	result := ParseSimulatedResponseAnthropic(raw, []string{"safe_tool"})
+
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("invented Anthropic tool calls were not filtered: %#v", result.ToolCalls)
+	}
+	if result.Content != "Safe Anthropic response" {
+		t.Fatalf("safe content = %q, want %q", result.Content, "Safe Anthropic response")
+	}
+	if result.FinishReason != "stop" {
+		t.Fatalf("finish reason = %q, want stop after filtering all tool calls", result.FinishReason)
+	}
+}
+
+func TestParseSimulatedResponseKeepsFlatFunctionCallNamespace(t *testing.T) {
+	raw := `{
+		"choices": [{
+			"message": {
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [{
+					"type": "function_call",
+					"id": "call_namespaced",
+					"name": "ctx_batch_execute",
+					"namespace": "mcp__context_mode",
+					"arguments": "{\"commands\":[]}"
+				}]
+			},
+			"finish_reason": "tool_calls"
+		}]
+	}`
+
+	result := ParseSimulatedResponse(raw, []string{"ctx_batch_execute"})
+
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.ToolCalls))
+	}
+	if result.ToolCalls[0].Namespace != "mcp__context_mode" {
+		t.Fatalf("namespace = %q, want mcp__context_mode", result.ToolCalls[0].Namespace)
 	}
 }
