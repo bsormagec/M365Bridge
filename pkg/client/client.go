@@ -310,7 +310,17 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 		}
 		defer conn.Close()
 
-		payloadStr, err := payload.BuildConversationPayload(hexSID, uuidSID, messages, tone, gptOverride, false, hasTools, nil)
+		payloadStr, err := payload.BuildConversationPayload(
+			hexSID,
+			uuidSID,
+			messages,
+			conversationID == "",
+			tone,
+			gptOverride,
+			false,
+			hasTools,
+			nil,
+		)
 		if err != nil {
 			logging.Errorf("ChatConversationStreamGen: payload build failed: %v", err)
 			ch <- StreamChunk{Error: err}

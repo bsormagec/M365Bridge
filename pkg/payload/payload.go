@@ -366,18 +366,63 @@ func BuildPayload(hexSID, uuidSID, text, tone, gptOverride string, enableFileUpl
 	return string(data), nil
 }
 
+func conversationTextForM365(messages []Message, includeHistory bool) string {
+	if len(messages) == 0 {
+		return ""
+	}
+
+	lastText := messages[len(messages)-1].Content
+	if !includeHistory {
+		return lastText
+	}
+
+	lastConversationIndex := -1
+	conversationCount := 0
+	for index, message := range messages {
+		if message.Role == "system" || strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+		lastConversationIndex = index
+		conversationCount++
+	}
+	if conversationCount <= 1 {
+		return lastText
+	}
+
+	var flattened strings.Builder
+	flattened.WriteString("CLIENT-PROVIDED CONVERSATION HISTORY\n")
+	for index, message := range messages {
+		if message.Role == "system" || strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+		if index == lastConversationIndex {
+			flattened.WriteString("\nCURRENT USER MESSAGE\n")
+			flattened.WriteString(message.Content)
+			continue
+		}
+		label := strings.ToUpper(message.Role)
+		if label == "TOOL" {
+			label = "TOOL RESULT"
+		}
+		flattened.WriteString(label)
+		flattened.WriteString(": ")
+		flattened.WriteString(message.Content)
+		flattened.WriteString("\n")
+	}
+	return flattened.String()
+}
+
 // BuildConversationPayload constructs a chat request payload with conversation history.
 // When hasTools is true, code_interpreter option flags are stripped to prevent
 // M365 from intercepting file/code operations.
-func BuildConversationPayload(hexSID, uuidSID string, messages []Message, tone, gptOverride string, enableFileUpload, hasTools bool, extraOptions []string) (string, error) {
+func BuildConversationPayload(hexSID, uuidSID string, messages []Message, includeHistory bool, tone, gptOverride string, enableFileUpload, hasTools bool, extraOptions []string) (string, error) {
 	invocationID := uuid.New().String()
 
 	// Extract annotations from the last message (images are attached to the last user message)
 	var annotations []MessageAnnotation
 	hasImages := false
-	lastText := ""
+	lastText := conversationTextForM365(messages, includeHistory)
 	if len(messages) > 0 {
-		lastText = messages[len(messages)-1].Content
 		annotations = messages[len(messages)-1].Annotations
 		hasImages = len(annotations) > 0
 	}
