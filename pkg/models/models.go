@@ -57,6 +57,11 @@ var ModelRegistry = map[string]ModelConfig{
 		Override: "",
 		OpenAIID: "gpt-5.5-reasoning",
 	},
+	"gpt5.6-reasoning": {
+		Tone:     "Gpt_5_6_Reasoning",
+		Override: "",
+		OpenAIID: "gpt-5.6-reasoning",
+	},
 	// Claude — real Anthropic models (verified via tone test, July 2026)
 	"claude": {
 		Tone:     "Claude_Sonnet",

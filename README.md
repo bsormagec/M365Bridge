@@ -305,7 +305,7 @@ Then follow Steps 3-6 above.
 | Flag            | Type   | Default | Description                                                              |
 |-----------------|--------|---------|--------------------------------------------------------------------------|
 | `-i`            | bool   | false   | Interactive mode (multi-turn conversation)                               |
-| `--model`       | string | `auto`  | Model to use: `auto`, `quick`, `reasoning`, `gpt5.5`, `gpt5.5-reasoning` |
+| `--model`       | string | `auto`  | Model to use: `auto`, `quick`, `reasoning`, `gpt5.5`, `gpt5.5-reasoning`, `gpt5.6-reasoning` |
 | `--reasoning`   | bool   | false   | Use reasoning mode                                                       |
 | `--no-stream`   | bool   | false   | Disable streaming, print full response at once                           |
 | `--list-models` | bool   | false   | List all available models and exit                                       |
@@ -494,6 +494,7 @@ All model selection is via the `tone` field sent to the M365 backend. The `Overr
 | `reasoning`                | Magic             | gpt-4-reasoning   | No        | GPT-5   |
 | `gpt5.5`                   | Gpt_5_5_Chat      | gpt-5.5           | No        | GPT-5   |
 | `gpt5.5-reasoning`         | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Yes       | GPT-5   |
+| `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Yes       | GPT-5   |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | No        | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | No        | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | No        | Claude  |
@@ -506,8 +507,9 @@ All model selection is via the `tone` field sent to the M365 backend. The `Overr
 | General purpose, let backend decide          | `auto`             |
 | Fast responses, simple questions             | `quick`            |
 | Complex reasoning, multi-step problems       | `reasoning`        |
-| GPT-5.5 chat (latest conversational model)   | `gpt5.5`           |
-| GPT-5.5 with deep thinking (shows reasoning) | `gpt5.5-reasoning` |
+| GPT-5.5 chat                                 | `gpt5.5`           |
+| GPT-5.5 with deep thinking                   | `gpt5.5-reasoning` |
+| GPT-5.6 with deep thinking (latest)          | `gpt5.6-reasoning` |
 | Claude Sonnet 4.6 (Anthropic)                | `claude-sonnet`    |
 | Claude Opus 4.6 (Anthropic, most capable)    | `claude-opus`      |
 
