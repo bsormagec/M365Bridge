@@ -326,9 +326,12 @@ Starts the HTTP API server.
 
 Runs the browser-based setup wizard. Reads JSON from file containing `oid`, `tenant`, and `refresh_token`.
 
-| Flag     | Type   | Default           | Description             |
-|----------|--------|-------------------|-------------------------|
-| `--file` | string | `data/setup.json` | Path to setup JSON file |
+| Flag                | Type   | Default                       | Description                                                  |
+|---------------------|--------|-------------------------------|--------------------------------------------------------------|
+| `--file`            | string | `data/setup.json`             | Path to setup JSON file                                      |
+| `--browser`         | bool   | `false`                       | Interactively capture setup credentials in dedicated Chrome  |
+| `--browser-path`    | string |                               | Chrome/Chromium executable path for `--browser`              |
+| `--browser-profile` | string | `data/m365-browser-profile`  | Dedicated owner-only Chrome profile for `--browser`          |
 
 ### Examples
 
@@ -353,7 +356,12 @@ Runs the browser-based setup wizard. Reads JSON from file containing `oid`, `ten
 
 # Run setup wizard with custom file
 ./bin/m365-bridge setup-wizard --file /path/to/setup.json
+
+# Capture credentials through a dedicated interactive Chrome profile
+./bin/m365-bridge setup-wizard --browser
 ```
+
+`--browser` opens a separate, project-owned Chrome profile; it never reads your normal browser profile. Complete sign-in, MFA, and any Conditional Access prompts yourself. The wizard captures only the target M365 refresh token and the `ESTSAUTH` / `ESTSAUTHPERSISTENT` cookies from `login.microsoftonline.com`, then encrypts them using the existing credential store. This flow requires a desktop browser and is not designed for Docker or headless environments.
 
 ### API Server
 

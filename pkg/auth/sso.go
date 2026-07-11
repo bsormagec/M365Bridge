@@ -14,6 +14,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -66,6 +67,57 @@ func generatePKCE() (verifier, challenge string, err error) {
 	challenge = base64.RawURLEncoding.EncodeToString(hash[:])
 
 	return verifier, challenge, nil
+}
+
+func newSSOHTTPClient(store *SSOCookieStore) (*http.Client, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SSO cookie jar: %w", err)
+	}
+
+	loginURL, err := url.Parse("https://login.microsoftonline.com")
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse SSO login URL: %w", err)
+	}
+
+	httpCookies := make([]*http.Cookie, 0, len(store.Cookies))
+	for _, cookie := range store.Cookies {
+		domain := cookie.Domain
+		if domain == "" {
+			domain = loginURL.Host
+		}
+		httpCookies = append(httpCookies, &http.Cookie{
+			Name:     cookie.Name,
+			Value:    cookie.Value,
+			Path:     cookie.Path,
+			Domain:   domain,
+			Secure:   cookie.Secure,
+			HttpOnly: cookie.HttpOnly,
+		})
+	}
+	jar.SetCookies(loginURL, httpCookies)
+
+	return &http.Client{
+		Jar: jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 15 * time.Second,
+	}, nil
+}
+
+func silentAuthorizeParams(clientID, redirectURI, scope, state, challenge string) url.Values {
+	return url.Values{
+		"client_id":             {clientID},
+		"response_type":         {"code"},
+		"redirect_uri":          {redirectURI},
+		"scope":                 {scope},
+		"response_mode":         {"fragment"},
+		"prompt":                {"none"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"state":                 {state},
+	}
 }
 
 // SaveSSOCookies encrypts and stores SSO cookies to disk.
@@ -198,35 +250,19 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 	}
 	cookieHeader := strings.Join(cookieParts, "; ")
 
-	client := &http.Client{
-		// Don't follow redirects automatically; we need to capture the auth code
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Timeout: 15 * time.Second,
-	}
-
 	// Generate PKCE
 	verifier, challenge, err := generatePKCE()
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)
 	}
 
-	// Build authorize URL for silent auth using SSO cookies
-	// sso_reload=True tells the server to use SSO cookies and skip the BssoInterrupt page.
-	// prompt=none breaks SSO cookie recognition, so we omit it.
-	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tm.tenant)
-	params := url.Values{
-		"client_id":             {tm.clientID},
-		"response_type":         {"code"},
-		"redirect_uri":          {defaultRedirectURI},
-		"scope":                 {tm.scope + " offline_access"},
-		"response_mode":         {"fragment"},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"S256"},
-		"state":                 {"m365bridge-sso"},
-		"sso_reload":            {"True"},
+	client, err := newSSOHTTPClient(store)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)
 	}
+
+	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tm.tenant)
+	params := silentAuthorizeParams(tm.clientID, defaultRedirectURI, tm.scope+" offline_access", "m365bridge-sso", challenge)
 
 	authReq, err := http.NewRequest("GET", authorizeURL+"?"+params.Encode(), nil)
 	if err != nil {
@@ -694,19 +730,9 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 		return "", fmt.Errorf("PKCE failed: %w", err)
 	}
 
-	// Broker authorize URL with PKCE and brk_ params
-	params := url.Values{
-		"client_id":             {brokerClientID},
-		"response_type":         {"code"},
-		"redirect_uri":          {designerBrokerRedirectURI},
-		"scope":                 {designerBrokerScope},
-		"response_mode":         {"fragment"},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"S256"},
-		"brk_client_id":         {designerClientID},
-		"brk_redirect_uri":      {defaultRedirectURI},
-		"sso_reload":            {"True"},
-	}
+	params := silentAuthorizeParams(brokerClientID, designerBrokerRedirectURI, designerBrokerScope, "m365bridge-broker", challenge)
+	params.Set("brk_client_id", designerClientID)
+	params.Set("brk_redirect_uri", defaultRedirectURI)
 
 	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tm.tenant)
 	authReq, err := http.NewRequest("GET", authorizeURL+"?"+params.Encode(), nil)
@@ -717,11 +743,9 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 	authReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	authReq.Header.Set("Cookie", cookieHeader)
 
-	httpClient := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Timeout: 15 * time.Second,
+	httpClient, err := newSSOHTTPClient(store)
+	if err != nil {
+		return "", err
 	}
 
 	currentResp, err := httpClient.Do(authReq)

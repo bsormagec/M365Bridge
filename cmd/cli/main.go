@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -106,9 +107,21 @@ func runServer(args []string) {
 func runSetupWizard(args []string) {
 	fs := flag.NewFlagSet("setup-wizard", flag.ExitOnError)
 	file := fs.String("file", "data/setup.json", "Path to setup JSON file containing oid, tenant, and refresh_token")
+	browser := fs.Bool("browser", false, "Open a dedicated Chrome profile and capture setup credentials interactively")
+	browserPath := fs.String("browser-path", "", "Path to Chrome or Chromium executable (used with --browser)")
+	browserProfile := fs.String("browser-profile", "data/m365-browser-profile", "Dedicated Chrome profile directory (used with --browser)")
 	fs.Parse(args)
 
-	if err := setup.Run(*file); err != nil {
+	var err error
+	if *browser {
+		err = setup.RunBrowser(context.Background(), setup.BrowserSetupOptions{
+			ProfileDir:  *browserProfile,
+			BrowserPath: *browserPath,
+		})
+	} else {
+		err = setup.Run(*file)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
