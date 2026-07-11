@@ -76,6 +76,8 @@ func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice
 		lines = append(lines,
 			"Tool calls are supported here: emit assistant tool calls when appropriate.",
 			`If returning tool calls, use choices[0].message.tool_calls and set choices[0].finish_reason to "tool_calls".`,
+			`When returning tool calls, also put one brief user-facing progress update in choices[0].message.content describing the immediate action and why.`,
+			`For tool calls, choices[0].message.content must not be null; keep it concise and do not expose hidden reasoning or transport details.`,
 			`If returning plain text, use choices[0].message.content and set choices[0].finish_reason to "stop".`,
 			"For each tool call, function.arguments must be a JSON string value (not an object).",
 			`For a function inside a "type": "namespace" tool, keep the short function name and copy the enclosing namespace name into the tool call's "namespace" field.`,
@@ -157,6 +159,16 @@ type SimulatedResult struct {
 // is silently dropped. If all tool calls are dropped, the response is treated as
 // a plain content response. Pass nil to disable filtering (not recommended).
 func ParseSimulatedResponse(text string, allowedToolNames []string) SimulatedResult {
+	return parseSimulatedResponse(text, allowedToolNames, false)
+}
+
+// ParseSimulatedResponseResponses preserves assistant content alongside valid
+// tool calls so Responses clients can display a commentary preamble.
+func ParseSimulatedResponseResponses(text string, allowedToolNames []string) SimulatedResult {
+	return parseSimulatedResponse(text, allowedToolNames, true)
+}
+
+func parseSimulatedResponse(text string, allowedToolNames []string, preserveToolContent bool) SimulatedResult {
 	allowed := make(map[string]bool, len(allowedToolNames))
 	for _, n := range allowedToolNames {
 		allowed[strings.TrimSpace(n)] = true
@@ -189,7 +201,7 @@ func ParseSimulatedResponse(text string, allowedToolNames []string) SimulatedRes
 	}
 
 	result.HasPayload = true
-	parseChatCompletionPayload(best, &result, allowed)
+	parseChatCompletionPayload(best, &result, allowed, preserveToolContent)
 	if len(result.ToolCalls) > 0 {
 		logging.Infof("ParseSimulatedResponse: parsed %d tool calls", len(result.ToolCalls))
 	} else if result.Content != "" {
@@ -364,7 +376,7 @@ func scoreAnthropicCandidate(candidate map[string]interface{}) int {
 // chat.completion-shaped JSON object into the result. Tool calls whose name is
 // not in `allowed` (when non-empty) are dropped — this strips M365-invented
 // tools like "code_interpreter" that the client never declared.
-func parseChatCompletionPayload(payload map[string]interface{}, result *SimulatedResult, allowed map[string]bool) {
+func parseChatCompletionPayload(payload map[string]interface{}, result *SimulatedResult, allowed map[string]bool, preserveToolContent bool) {
 	choices, ok := payload["choices"].([]interface{})
 	if !ok || len(choices) == 0 {
 		return
@@ -407,7 +419,11 @@ func parseChatCompletionPayload(payload map[string]interface{}, result *Simulate
 			})
 		}
 		if len(result.ToolCalls) > 0 {
-			result.Content = ""
+			if preserveToolContent {
+				result.Content = normalizeMessageContent(message["content"])
+			} else {
+				result.Content = ""
+			}
 			result.FinishReason = "tool_calls"
 			return
 		}

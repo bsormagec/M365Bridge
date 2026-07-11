@@ -218,6 +218,93 @@ func TestParseResponsesSimulationAcceptsFlatResponsesToolDefinition(t *testing.T
 	}
 }
 
+func TestParseResponsesSimulationPreservesToolPreamble(t *testing.T) {
+	policy, err := newResponsesToolPolicy(responsesTestTools(), "required")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const preamble = "Önce nonce dosyasını okuyup sonucu doğrulayacağım."
+	raw := "```json\n" +
+		`{"choices":[{"message":{"role":"assistant","content":"` +
+		preamble +
+		`","tool_calls":[{"id":"call_test","type":"function","function":{"name":"read_nonce","arguments":"{\"path\":\"nonce.txt\"}"}}]},"finish_reason":"tool_calls"}]}` +
+		"\n```"
+
+	result, err := parseResponsesSimulation(raw, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.content != preamble {
+		t.Fatalf("tool preamble = %q, want %q", result.content, preamble)
+	}
+	if len(result.toolCalls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.toolCalls))
+	}
+}
+
+func TestParseResponsesSimulationAddsSafeFallbackPreamble(t *testing.T) {
+	policy, err := newResponsesToolPolicy(responsesTestTools(), "required")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := parseResponsesSimulation(
+		simulatedToolCallEnvelope("read_nonce"),
+		policy,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(result.content) == "" {
+		t.Fatal("tool call without model content did not receive a visible fallback preamble")
+	}
+	for _, forbidden := range []string{"chatcmpl-", `"choices"`, `"tool_calls"`} {
+		if strings.Contains(result.content, forbidden) {
+			t.Fatalf("fallback preamble leaked transport marker %q: %q", forbidden, result.content)
+		}
+	}
+}
+
+func TestBuildResponsesObjectPlacesCommentaryBeforeToolCall(t *testing.T) {
+	call := client.ToolCall{
+		ID:   "call_read",
+		Type: "function",
+		Function: client.ToolCallFunction{
+			Name:      "read_nonce",
+			Arguments: `{"path":"nonce.txt"}`,
+		},
+	}
+
+	response := buildResponsesObject(
+		"resp_test",
+		"gpt-test",
+		"Nonce dosyasını şimdi okuyorum.",
+		"",
+		[]client.ToolCall{call},
+		map[string]string{"read_nonce": "function"},
+		"tool_calls",
+		1,
+		1,
+		0,
+	)
+	output, ok := response["output"].([]map[string]interface{})
+	if !ok {
+		t.Fatalf("response output has unexpected type: %T", response["output"])
+	}
+	if len(output) != 2 {
+		t.Fatalf("output item count = %d, want 2: %#v", len(output), output)
+	}
+	if output[0]["type"] != "message" {
+		t.Fatalf("first output item type = %#v, want message", output[0]["type"])
+	}
+	if output[0]["phase"] != "commentary" {
+		t.Fatalf("tool preamble phase = %#v, want commentary", output[0]["phase"])
+	}
+	if output[1]["type"] != "function_call" {
+		t.Fatalf("second output item type = %#v, want function_call", output[1]["type"])
+	}
+}
+
 func TestBuildResponsesToolCallItemUsesDeclaredBuiltInType(t *testing.T) {
 	call := client.ToolCall{
 		ID:   "call_search",
@@ -269,6 +356,28 @@ func TestBuildResponsesToolCallItemIncludesNamespace(t *testing.T) {
 	}
 	if item["name"] != "js" {
 		t.Fatalf("function_call name = %#v", item["name"])
+	}
+}
+
+func TestBuildResponsesToolCallItemIncludesEmptyArgumentsWhileInProgress(t *testing.T) {
+	call := client.ToolCall{
+		ID:   "call_read",
+		Type: "function",
+		Function: client.ToolCallFunction{
+			Name:      "read_nonce",
+			Arguments: `{"path":"nonce.txt"}`,
+		},
+	}
+
+	item := buildResponsesToolCallItem(
+		"call_read",
+		call,
+		map[string]string{"read_nonce": "function"},
+		"in_progress",
+	)
+
+	if arguments, ok := item["arguments"]; !ok || arguments != "" {
+		t.Fatalf("in-progress arguments = %#v, want empty string", arguments)
 	}
 }
 

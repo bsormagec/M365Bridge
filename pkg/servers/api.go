@@ -2402,6 +2402,8 @@ func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes m
 	}
 	if status == "completed" {
 		item["arguments"] = call.Function.Arguments
+	} else {
+		item["arguments"] = ""
 	}
 	return item
 }
@@ -2442,11 +2444,10 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 		content:      text,
 		finishReason: "stop",
 	}
-	simulated := toolcalling.ParseSimulatedResponse(text, policy.allowedToolNames)
+	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames)
 	if simulated.HasPayload {
 		result.content = simulated.Content
 		if len(simulated.ToolCalls) > 0 {
-			result.content = ""
 			result.finishReason = "tool_calls"
 			for _, parsed := range simulated.ToolCalls {
 				namespace, ok := resolveResponsesToolNamespace(
@@ -2468,6 +2469,9 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 				})
 			}
 		}
+	}
+	if len(result.toolCalls) > 0 && strings.TrimSpace(result.content) == "" {
+		result.content = "I'm using the relevant tool now and will continue with its result."
 	}
 
 	if policy.required && len(result.toolCalls) == 0 {
@@ -2977,24 +2981,19 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 		outputIndex++
 	}
 
-	// Add function_call or built-in client tool items.
-	for i, tc := range toolCalls {
-		callID := tc.ID
-		if callID == "" {
-			callID = fmt.Sprintf("call_%d", i)
-		}
-		output = append(output, buildResponsesToolCallItem(callID, tc, toolTypes, "completed"))
-		outputIndex++
-	}
-
 	// Add message item with output_text (only if there is text content)
 	if text != "" || len(toolCalls) == 0 {
 		msgID := fmt.Sprintf("msg_%s", responseID)
+		phase := "final_answer"
+		if len(toolCalls) > 0 {
+			phase = "commentary"
+		}
 		output = append(output, map[string]interface{}{
 			"id":     msgID,
 			"type":   "message",
 			"status": "completed",
 			"role":   "assistant",
+			"phase":  phase,
 			"content": []map[string]interface{}{
 				{
 					"type":        "output_text",
@@ -3003,6 +3002,16 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 				},
 			},
 		})
+		outputIndex++
+	}
+
+	// Add function_call or built-in client tool items after commentary.
+	for i, tc := range toolCalls {
+		callID := tc.ID
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d", i)
+		}
+		output = append(output, buildResponsesToolCallItem(callID, tc, toolTypes, "completed"))
 		outputIndex++
 	}
 
@@ -3138,8 +3147,11 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	openaiModel := cfg.OpenAIID
 
 	// Helper to send a Responses SSE event
+	sequenceNumber := 0
 	sendEvent := func(eventType string, data map[string]interface{}) {
 		data["type"] = eventType
+		data["sequence_number"] = sequenceNumber
+		sequenceNumber++
 		jsonData, _ := json.Marshal(data)
 		fmt.Fprintf(w, "data: %s\n\n", jsonData)
 		flusher.Flush()
@@ -3230,12 +3242,22 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 						},
 					},
 				})
+				sendEvent("response.reasoning_summary_part.added", map[string]interface{}{
+					"item_id":       reasoningID,
+					"output_index":  0,
+					"summary_index": 0,
+					"part": map[string]interface{}{
+						"type": "summary_text",
+						"text": "",
+					},
+				})
 				reasoningItemEmitted = true
 			}
 			sendEvent("response.reasoning_summary_text.delta", map[string]interface{}{
-				"item_id":      reasoningID,
-				"output_index": 0,
-				"delta":        chunk.Thinking,
+				"item_id":       reasoningID,
+				"output_index":  0,
+				"summary_index": 0,
+				"delta":         chunk.Thinking,
 			})
 		}
 
@@ -3259,6 +3281,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 							"type":    "message",
 							"status":  "in_progress",
 							"role":    "assistant",
+							"phase":   "final_answer",
 							"content": []interface{}{},
 						},
 					})
@@ -3335,9 +3358,19 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	// Finalize reasoning item if emitted
 	if reasoningItemEmitted && !toolCallingEnabled {
 		sendEvent("response.reasoning_summary_text.done", map[string]interface{}{
-			"item_id":      reasoningID,
-			"output_index": 0,
-			"text":         thinkingText,
+			"item_id":       reasoningID,
+			"output_index":  0,
+			"summary_index": 0,
+			"text":          thinkingText,
+		})
+		sendEvent("response.reasoning_summary_part.done", map[string]interface{}{
+			"item_id":       reasoningID,
+			"output_index":  0,
+			"summary_index": 0,
+			"part": map[string]interface{}{
+				"type": "summary_text",
+				"text": thinkingText,
+			},
 		})
 		sendEvent("response.output_item.done", map[string]interface{}{
 			"output_index": 0,
@@ -3423,42 +3456,11 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 			outputIdx = messageOutputIndex + 1
 		}
 
-		// Emit tool call items
-		toolTypes := responsesToolTypes(toolPolicy.tools)
-		for i, tc := range toolCalls {
-			callID := tc.ID
-			if callID == "" {
-				callID = fmt.Sprintf("call_%d", i)
-			}
-			toolKey := responsesToolKey(
-				tc.Function.Namespace,
-				tc.Function.Name,
-			)
-			isToolSearch := toolTypes[toolKey] == "tool_search"
-			sendEvent("response.output_item.added", map[string]interface{}{
-				"output_index": outputIdx,
-				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
-			})
-			if !isToolSearch {
-				sendEvent("response.function_call_arguments.delta", map[string]interface{}{
-					"item_id":      callID,
-					"output_index": outputIdx,
-					"delta":        tc.Function.Arguments,
-				})
-				sendEvent("response.function_call_arguments.done", map[string]interface{}{
-					"item_id":      callID,
-					"output_index": outputIdx,
-					"arguments":    tc.Function.Arguments,
-				})
-			}
-			sendEvent("response.output_item.done", map[string]interface{}{
-				"output_index": outputIdx,
-				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "completed"),
-			})
-			outputIdx++
-		}
-
 		if messageItemEmitted {
+			phase := "final_answer"
+			if len(toolCalls) > 0 {
+				phase = "commentary"
+			}
 			sendEvent("response.output_text.done", map[string]interface{}{
 				"item_id":       msgID,
 				"output_index":  messageOutputIndex,
@@ -3482,6 +3484,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					"type":   "message",
 					"status": "completed",
 					"role":   "assistant",
+					"phase":  phase,
 					"content": []map[string]interface{}{
 						{
 							"type":        "output_text",
@@ -3500,6 +3503,10 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					finishReason = "length"
 				}
 			}
+			phase := "final_answer"
+			if len(toolCalls) > 0 {
+				phase = "commentary"
+			}
 
 			sendEvent("response.output_item.added", map[string]interface{}{
 				"output_index": outputIdx,
@@ -3508,6 +3515,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					"type":    "message",
 					"status":  "in_progress",
 					"role":    "assistant",
+					"phase":   phase,
 					"content": []interface{}{},
 				},
 			})
@@ -3550,6 +3558,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					"type":   "message",
 					"status": "completed",
 					"role":   "assistant",
+					"phase":  phase,
 					"content": []map[string]interface{}{
 						{
 							"type":        "output_text",
@@ -3559,6 +3568,43 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					},
 				},
 			})
+			outputIdx++
+		}
+
+		// Emit tool call items after the user-facing commentary.
+		toolTypes := responsesToolTypes(toolPolicy.tools)
+		for i, tc := range toolCalls {
+			callID := tc.ID
+			if callID == "" {
+				callID = fmt.Sprintf("call_%d", i)
+			}
+			toolKey := responsesToolKey(
+				tc.Function.Namespace,
+				tc.Function.Name,
+			)
+			isToolSearch := toolTypes[toolKey] == "tool_search"
+			sendEvent("response.output_item.added", map[string]interface{}{
+				"output_index": outputIdx,
+				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
+			})
+			if !isToolSearch {
+				sendEvent("response.function_call_arguments.delta", map[string]interface{}{
+					"item_id":      callID,
+					"output_index": outputIdx,
+					"delta":        tc.Function.Arguments,
+				})
+				sendEvent("response.function_call_arguments.done", map[string]interface{}{
+					"item_id":      callID,
+					"output_index": outputIdx,
+					"name":         tc.Function.Name,
+					"arguments":    tc.Function.Arguments,
+				})
+			}
+			sendEvent("response.output_item.done", map[string]interface{}{
+				"output_index": outputIdx,
+				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "completed"),
+			})
+			outputIdx++
 		}
 	} else {
 		// Non-tool-calling mode: finalize message item if emitted
@@ -3593,6 +3639,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					"type":   "message",
 					"status": "completed",
 					"role":   "assistant",
+					"phase":  "final_answer",
 					"content": []map[string]interface{}{
 						{
 							"type":        "output_text",

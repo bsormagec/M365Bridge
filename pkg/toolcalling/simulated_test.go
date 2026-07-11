@@ -34,10 +34,13 @@ func TestBuildSimulatedPromptResponsesKeepsChatCompletionResultEnvelope(t *testi
 
 	for _, want := range []string{
 		"choices[0].message.tool_calls",
+		"choices[0].message.content",
 		`choices[0].finish_reason`,
 		"function.arguments must be a JSON string",
 		"requires at least one tool call",
 		"namespace",
+		"brief user-facing progress update",
+		"must not be null",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("Responses prompt missing result-envelope instruction %q:\n%s", want, prompt)
