@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +73,27 @@ func TestAcquireDesignerTokenDoesNotReacquireTransientFailure(t *testing.T) {
 	_, _, err := tm.acquireDesignerToken()
 	if !errors.Is(err, transientErr) {
 		t.Fatalf("expected transient error, got %v", err)
+	}
+}
+
+func TestSummarizeBrokerAuthorizeResponsePrefersAADSTSError(t *testing.T) {
+	body := `<!DOCTYPE html><html><head><title>Something went wrong</title></head><body>
+<p>AADSTS50011: The reply URL specified in the request does not match the reply URLs configured for the application.</p>
+</body></html>`
+
+	summary := summarizeBrokerAuthorizeResponse(body)
+	if !strings.Contains(summary, "AADSTS50011") {
+		t.Fatalf("expected AADSTS error in summary, got %q", summary)
+	}
+	if strings.Contains(summary, "<") {
+		t.Fatalf("expected summary without HTML markup, got %q", summary)
+	}
+}
+
+func TestSummarizeBrokerAuthorizeResponseUsesTitleFallback(t *testing.T) {
+	summary := summarizeBrokerAuthorizeResponse("<html><head><title>Something went wrong</title></head><body></body></html>")
+	if summary != "page title: Something went wrong" {
+		t.Fatalf("unexpected fallback summary: %q", summary)
 	}
 }
 

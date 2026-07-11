@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -286,6 +287,36 @@ func extractMetaRefreshURL(html string) string {
 	}
 
 	return strings.TrimSpace(content[urlIdx+4:])
+}
+
+func summarizeBrokerAuthorizeResponse(body string) string {
+	const aadSTSMarker = "AADSTS"
+	if start := strings.Index(body, aadSTSMarker); start >= 0 {
+		details := body[start:]
+		if end := strings.IndexAny(details, "<\r\n"); end >= 0 {
+			details = details[:end]
+		}
+		if details = strings.TrimSpace(html.UnescapeString(details)); details != "" {
+			return details
+		}
+	}
+
+	lowerBody := strings.ToLower(body)
+	if titleStart := strings.Index(lowerBody, "<title>"); titleStart >= 0 {
+		contentStart := titleStart + len("<title>")
+		if titleEnd := strings.Index(lowerBody[contentStart:], "</title>"); titleEnd >= 0 {
+			title := strings.TrimSpace(html.UnescapeString(body[contentStart : contentStart+titleEnd]))
+			if title != "" {
+				return "page title: " + title
+			}
+		}
+	}
+
+	compactBody := strings.Join(strings.Fields(body), " ")
+	if len(compactBody) > 300 {
+		compactBody = compactBody[:300]
+	}
+	return compactBody
 }
 
 // exchangeAuthCode exchanges an authorization code for access and refresh tokens.
@@ -651,10 +682,7 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 			if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
 				location = metaURL
 			} else {
-				if len(bodyStr) > 500 {
-					bodyStr = bodyStr[:500]
-				}
-				return "", fmt.Errorf("no redirect from broker authorize (status %d, hop %d): %s", currentResp.StatusCode, i, bodyStr)
+				return "", fmt.Errorf("no redirect from broker authorize (status %d, hop %d): %s", currentResp.StatusCode, i, summarizeBrokerAuthorizeResponse(bodyStr))
 			}
 		}
 
