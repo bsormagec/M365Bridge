@@ -29,7 +29,7 @@ const (
 
 func main() {
 	// Initialize dual-writer logger (stdout + data/proxy.log)
-	if err := logging.Init(logging.LevelDebug); err != nil {
+	if err := logging.Init(logging.LevelWarn); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
 		os.Exit(1)
 	}

@@ -223,7 +223,7 @@ func splitCookiesByDomain(cookies []auth.SSOCookie) ([]auth.SSOCookie, []auth.SS
 		switch domain {
 		case "login.microsoftonline.com":
 			loginCookies = append(loginCookies, cookie)
-		case "m365.cloud.microsoft", "microsoft.com":
+		case "m365.cloud.microsoft":
 			m365Cookies = append(m365Cookies, cookie)
 		}
 	}

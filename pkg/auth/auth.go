@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/crypto"
@@ -41,6 +42,11 @@ type TokenCache struct {
 
 // TokenManager handles OAuth2 token lifecycle management.
 type TokenManager struct {
+	refreshMu              sync.Mutex
+	refreshInFlight        bool
+	refreshDone            chan struct{}
+	lastRefreshToken       string
+	lastRefreshErr         error
 	tenant                 string
 	clientID               string
 	scope                  string
@@ -86,6 +92,36 @@ func (tm *TokenManager) Get() (string, error) {
 // Refresh exchanges the refresh token for a new access token.
 // Updates both the refresh token file and cache file.
 func (tm *TokenManager) Refresh() (string, error) {
+	tm.refreshMu.Lock()
+	if tm.refreshInFlight {
+		done := tm.refreshDone
+		tm.refreshMu.Unlock()
+		<-done
+		tm.refreshMu.Lock()
+		token, err := tm.lastRefreshToken, tm.lastRefreshErr
+		tm.refreshMu.Unlock()
+		return token, err
+	}
+	tm.refreshInFlight = true
+	tm.refreshDone = make(chan struct{})
+	tm.refreshMu.Unlock()
+
+	token, err := tm.refresh()
+
+	tm.refreshMu.Lock()
+	tm.lastRefreshToken = token
+	tm.lastRefreshErr = err
+	tm.refreshInFlight = false
+	close(tm.refreshDone)
+	tm.refreshMu.Unlock()
+	return token, err
+}
+
+func (tm *TokenManager) refresh() (string, error) {
+	startedAt := time.Now()
+	defer func() {
+		logging.Debugf("TokenManager.Refresh: completed in %s", time.Since(startedAt).Round(time.Millisecond))
+	}()
 	logging.Info("TokenManager.Refresh: starting token refresh")
 	refreshToken, err := tm.readRefreshToken()
 	if err != nil {
@@ -261,7 +297,7 @@ func (tm *TokenManager) writeRefreshToken(token string) error {
 		}
 	}
 
-	return os.WriteFile(tm.refreshFile, []byte(encrypted), 0600)
+	return writePrivateFile(tm.refreshFile, []byte(encrypted))
 }
 
 // loadFromCache attempts to load a valid access token from cache.
@@ -299,5 +335,34 @@ func (tm *TokenManager) writeCache(cache TokenCache) error {
 		}
 	}
 
-	return os.WriteFile(tm.cacheFile, data, 0600)
+	return writePrivateFile(tm.cacheFile, data)
+}
+
+// writePrivateFile atomically replaces a credential file with owner-only permissions.
+func writePrivateFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(dir, ".m365bridge-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }

@@ -17,7 +17,6 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -137,14 +136,10 @@ func SaveSSOCookies(cookies []SSOCookie) error {
 		return fmt.Errorf("failed to encrypt SSO cookies: %w", err)
 	}
 
-	dir := filepath.Dir(ssoCookiesFile)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return fmt.Errorf("failed to create directory: %w", err)
-		}
+	if err := writePrivateFile(ssoCookiesFile, []byte(encrypted)); err != nil {
+		return fmt.Errorf("failed to save SSO cookies: %w", err)
 	}
-
-	return os.WriteFile(ssoCookiesFile, []byte(encrypted), 0600)
+	return nil
 }
 
 // SaveM365Cookies stores browser cookies used by M365 web APIs.
@@ -163,10 +158,11 @@ func SaveM365Cookies(cookies []SSOCookie) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal M365 cookies: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(m365CookiesFile), 0700); err != nil {
-		return fmt.Errorf("failed to create M365 cookie directory: %w", err)
+	encrypted, err := crypto.Encrypt(string(data))
+	if err != nil {
+		return fmt.Errorf("failed to encrypt M365 cookies: %w", err)
 	}
-	if err := os.WriteFile(m365CookiesFile, data, 0600); err != nil {
+	if err := writePrivateFile(m365CookiesFile, []byte(encrypted)); err != nil {
 		return fmt.Errorf("failed to save M365 cookies: %w", err)
 	}
 	return nil
@@ -205,6 +201,11 @@ func (tm *TokenManager) M365CookieHeader() (string, error) {
 		return "", fmt.Errorf("%w: %v", ErrM365CookiesUnavailable, err)
 	}
 
+	decrypted, decryptErr := crypto.Decrypt(string(data))
+	if decryptErr == nil {
+		data = []byte(decrypted)
+	}
+
 	var store struct {
 		Cookies []SSOCookie `json:"cookies"`
 	}
@@ -215,7 +216,7 @@ func (tm *TokenManager) M365CookieHeader() (string, error) {
 	var cookieParts []string
 	for _, cookie := range store.Cookies {
 		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
-		if domain != "m365.cloud.microsoft" && domain != "microsoft.com" {
+		if domain != "m365.cloud.microsoft" {
 			continue
 		}
 		if cookie.Name == "" || cookie.Value == "" {
@@ -241,7 +242,11 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 		return "", fmt.Errorf("%w: no SSO cookies available: %v", ErrRefreshFailed, err)
 	}
 
-	logging.Debugf("reauthWithSSO: loaded %d SSO cookies captured at %s", len(store.Cookies), store.CapturedAt.Format(time.RFC3339))
+	age := time.Since(store.CapturedAt).Round(time.Minute)
+	logging.Debugf("reauthWithSSO: loaded %d SSO cookies captured at %s (age=%s)", len(store.Cookies), store.CapturedAt.Format(time.RFC3339), age)
+	if age > 30*24*time.Hour {
+		logging.Warnf("reauthWithSSO: SSO cookies are %s old; rerun setup-wizard --browser if reauthentication fails", age)
+	}
 
 	// Build Cookie header string from SSO cookies
 	var cookieParts []string
@@ -916,12 +921,10 @@ func (tm *TokenManager) writeBrokerRefreshToken(token string) error {
 		return fmt.Errorf("failed to encrypt broker refresh token: %w", err)
 	}
 
-	dir := filepath.Dir(designerBrokerRefreshFile)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("failed to create directory for broker refresh token: %w", err)
+	if err := writePrivateFile(designerBrokerRefreshFile, []byte(encrypted)); err != nil {
+		return fmt.Errorf("failed to save broker refresh token: %w", err)
 	}
-
-	return os.WriteFile(designerBrokerRefreshFile, []byte(encrypted), 0600)
+	return nil
 }
 
 // generateClientRequestID generates a UUID for the client-request-id parameter.

@@ -106,6 +106,33 @@ func TestM365CookieHeaderRequiresM365DomainCookie(t *testing.T) {
 	}
 }
 
+func TestM365CookieStoreIsEncryptedAndFiltersUnexpectedDomains(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+	if err := SaveM365Cookies([]SSOCookie{
+		{Name: "M365Session", Value: "m365-secret", Domain: "m365.cloud.microsoft"},
+		{Name: "Unrelated", Value: "exclude", Domain: "microsoft.com"},
+	}); err != nil {
+		t.Fatalf("save M365 cookies: %v", err)
+	}
+
+	data, err := os.ReadFile(m365CookiesFile)
+	if err != nil {
+		t.Fatalf("read M365 cookies: %v", err)
+	}
+	if strings.Contains(string(data), "m365-secret") {
+		t.Fatal("M365 cookie store must not persist cookie values in plaintext")
+	}
+
+	tm := NewTokenManager("tenant", "client", "scope", "refresh", "cache")
+	header, err := tm.M365CookieHeader()
+	if err != nil {
+		t.Fatalf("build M365 cookie header: %v", err)
+	}
+	if header != "M365Session=m365-secret" {
+		t.Fatalf("unexpected filtered M365 cookie header: %q", header)
+	}
+}
+
 func TestSummarizeBrokerAuthorizeResponsePrefersAADSTSError(t *testing.T) {
 	body := `<!DOCTYPE html><html><head><title>Something went wrong</title></head><body>
 <p>AADSTS50011: The reply URL specified in the request does not match the reply URLs configured for the application.</p>

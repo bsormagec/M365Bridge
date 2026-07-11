@@ -361,7 +361,7 @@ Runs the browser-based setup wizard. Reads JSON from file containing `oid`, `ten
 ./bin/m365-bridge setup-wizard --browser
 ```
 
-`--browser` opens a separate, project-owned Chrome profile; it never reads your normal browser profile. Complete sign-in, MFA, and any Conditional Access prompts yourself. The wizard captures only the target M365 refresh token and the `ESTSAUTH` / `ESTSAUTHPERSISTENT` cookies from `login.microsoftonline.com`, then encrypts them using the existing credential store. This flow requires a desktop browser and is not designed for Docker or headless environments.
+`--browser` opens a separate, project-owned Chrome profile; it never reads your normal browser profile. Complete sign-in, MFA, and any Conditional Access prompts yourself. The wizard captures the target M365 refresh token, `ESTSAUTH` / `ESTSAUTHPERSISTENT` from `login.microsoftonline.com`, and cookies scoped to `m365.cloud.microsoft` for M365 web API features. Login SSO cookies are encrypted separately from M365 web cookies. This flow requires a desktop browser and is not designed for Docker or headless environments.
 
 ### API Server
 
