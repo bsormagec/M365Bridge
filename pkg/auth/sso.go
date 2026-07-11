@@ -631,52 +631,81 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 		Timeout: 15 * time.Second,
 	}
 
-	resp, err := httpClient.Do(authReq)
+	currentResp, err := httpClient.Do(authReq)
 	if err != nil && !strings.Contains(err.Error(), "ErrUseLastResponse") {
 		return "", fmt.Errorf("broker authorize request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer currentResp.Body.Close()
 
-	// The redirect should be to https://m365.cloud.microsoft/spalanding#code=...
-	// because AAD redirects to brk_redirect_uri, not redirect_uri
-	location := resp.Header.Get("Location")
-	if location == "" {
-		body, _ := io.ReadAll(resp.Body)
-		bodyStr := string(body)
-		if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
-			location = metaURL
-		} else {
-			if len(bodyStr) > 500 {
-				bodyStr = bodyStr[:500]
+	// Follow redirects manually until we get the auth code or reach brk_redirect_uri.
+	// Microsoft AAD may return intermediate redirects (e.g. /jsdisabled, /kmsi)
+	// before the final redirect to spalanding#code=..., especially in headless/Docker
+	// environments where JS is not available.
+	const maxRedirects = 10
+	for i := 0; i < maxRedirects; i++ {
+		location := currentResp.Header.Get("Location")
+		if location == "" {
+			body, _ := io.ReadAll(currentResp.Body)
+			bodyStr := string(body)
+			// Check for meta refresh redirect in HTML (AAD sometimes uses this)
+			if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
+				location = metaURL
+			} else {
+				if len(bodyStr) > 500 {
+					bodyStr = bodyStr[:500]
+				}
+				return "", fmt.Errorf("no redirect from broker authorize (status %d, hop %d): %s", currentResp.StatusCode, i, bodyStr)
 			}
-			return "", fmt.Errorf("no redirect from broker authorize (status %d): %s", resp.StatusCode, bodyStr)
 		}
-	}
 
-	// Extract auth code from fragment
-	locURL, err := url.Parse(location)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse broker redirect URL: %w", err)
-	}
+		logging.Debugf("acquireBrokerRefreshTokenViaSSO: redirect hop %d -> %s", i, location[:min(120, len(location))])
 
-	authCode := locURL.Query().Get("code")
-	if authCode == "" {
-		fragment := locURL.Fragment
-		if fragment != "" {
-			fragParams, _ := url.ParseQuery(fragment)
-			authCode = fragParams.Get("code")
+		// Check if this is the final redirect with auth code (brk_redirect_uri = spalanding)
+		if strings.Contains(location, "m365.cloud.microsoft") {
+			locURL, err := url.Parse(location)
+			if err != nil {
+				return "", fmt.Errorf("failed to parse broker redirect URL: %w", err)
+			}
+
+			authCode := locURL.Query().Get("code")
 			if authCode == "" {
-				return "", fmt.Errorf("broker authorize error: %s: %s", fragParams.Get("error"), fragParams.Get("error_description"))
+				// Check for code in fragment (response_mode=fragment)
+				fragment := locURL.Fragment
+				if fragment != "" {
+					fragParams, _ := url.ParseQuery(fragment)
+					authCode = fragParams.Get("code")
+					if authCode == "" {
+						errCode := fragParams.Get("error")
+						errDesc := fragParams.Get("error_description")
+						return "", fmt.Errorf("broker authorize error: %s: %s", errCode, errDesc)
+					}
+				}
+			}
+			if authCode != "" {
+				logging.Info("acquireBrokerRefreshTokenViaSSO: obtained auth code, exchanging for broker tokens")
+				return tm.exchangeBrokerAuthCode(authCode, verifier)
 			}
 		}
-	}
-	if authCode == "" {
-		return "", fmt.Errorf("no auth code in broker authorize redirect: %s", location[:min(200, len(location))])
+
+		// Follow the redirect, forwarding SSO cookies
+		redirectReq, err := http.NewRequest("GET", location, nil)
+		if err != nil {
+			return "", fmt.Errorf("failed to create broker redirect request (hop %d): %w", i, err)
+		}
+		redirectReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+		redirectReq.Header.Set("Referer", "https://login.microsoftonline.com/")
+		redirectReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		redirectReq.Header.Set("Cookie", cookieHeader)
+
+		currentResp.Body.Close()
+		currentResp, err = httpClient.Do(redirectReq)
+		if err != nil && !strings.Contains(err.Error(), "ErrUseLastResponse") {
+			return "", fmt.Errorf("broker redirect request failed (hop %d): %w", i, err)
+		}
+		defer currentResp.Body.Close()
 	}
 
-	// Exchange auth code for token + refresh token via broker flow
-	logging.Info("acquireBrokerRefreshTokenViaSSO: obtained auth code, exchanging for broker tokens")
-	return tm.exchangeBrokerAuthCode(authCode, verifier)
+	return "", fmt.Errorf("broker authorize: max redirects (%d) reached without obtaining auth code", maxRedirects)
 }
 
 // exchangeBrokerAuthCode exchanges an authorization code for a broker

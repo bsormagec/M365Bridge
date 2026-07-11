@@ -102,89 +102,110 @@ The server needs a refresh token from your Microsoft 365 Copilot session. Extrac
 3. Paste and run the following JavaScript code:
 
 <details>
-<summary>Click to expand the JavaScript interceptor snippet</summary>
+<summary>Click to expand the JavaScript extraction snippet</summary>
 
 ```javascript
-(() => {
-const k = Object.keys(localStorage).find(k => k.startsWith('msal.') && k.includes('|'));
-if (!k) return 'NOT_FOUND';
-const p = k.split('|')[1].split('.');
-const oid = p[0], tenant = p[1];
+(async () => {
+// 1. Get oid/tenant
+let oid, tenant;
+for (const key of Object.keys(localStorage)) {
+  if (!key.includes('active-account-filters')) continue;
+  try {
+    const val = JSON.parse(localStorage.getItem(key));
+    if (val?.homeAccountId?.includes('.')) { [oid, tenant] = val.homeAccountId.split('.'); break; }
+  } catch(e) {}
+}
+if (!oid) {
+  const mk = Object.keys(localStorage).find(k => k.startsWith('msal.') && k.includes('|'));
+  if (mk) { const p = mk.split('|')[1]; if (p?.includes('.')) [oid, tenant] = p.split('.'); }
+}
+if (!oid || !tenant) return 'ERROR: No MSAL account found. Make sure you are logged in.';
 
+// 2. Install fetch interceptor to capture token response
 const origFetch = window.fetch;
+let captured = false;
 window.fetch = async function(...args) {
   const resp = await origFetch.apply(this, args);
-  const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
-  if (url.includes('login.microsoftonline.com') && url.includes('oauth2/v2.0/token')) {
+  const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+  if (url.includes('oauth2/v2.0/token') && !captured) {
     try {
       const clone = resp.clone();
       const data = await clone.json();
       if (data.refresh_token) {
-        console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-        console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
+        captured = true;
+        const result = {oid, tenant, refresh_token: data.refresh_token};
+        try {
+          if (window.cookieStore) {
+            const cookies = await cookieStore.getAll();
+            const sso = cookies.filter(c => c.name === 'ESTSAUTH' || c.name === 'ESTSAUTHPERSISTENT');
+            if (sso.length > 0) result.sso_cookies = sso.map(c => ({name: c.name, value: c.value}));
+          }
+        } catch(e) {}
+        console.log('===== COPY THE COMPLETE JSON BELOW =====');
+        console.log(JSON.stringify(result, null, 2));
       }
     } catch(e) {}
   }
   return resp;
 };
 
-const origXHROpen = XMLHttpRequest.prototype.open;
-const origXHRSend = XMLHttpRequest.prototype.send;
-XMLHttpRequest.prototype.open = function(method, url) {
-  this._url = url;
-  return origXHROpen.apply(this, arguments);
-};
-XMLHttpRequest.prototype.send = function(body) {
-  this.addEventListener('load', function() {
-    if (this._url && this._url.includes('oauth2/v2.0/token')) {
-      try {
-        const data = JSON.parse(this.responseText);
-        if (data.refresh_token) {
-          console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-          console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
-        }
-      } catch(e) {}
-    }
-  });
-  return origXHRSend.apply(this, arguments);
-};
-
-const keys = Object.keys(localStorage);
-let cleared = 0;
-for (const key of keys) {
-  if (key.includes('accesstoken') || key.includes('idtoken')) {
-    localStorage.removeItem(key);
-    cleared++;
-  }
-}
-
-window.dispatchEvent(new Event('load'));
-if (window.msal) {
+// 3. Find MSAL instance and force token refresh
+let msal = null;
+const checked = new WeakSet();
+function findMsal(obj, depth) {
+  if (!obj || depth > 3 || typeof obj !== 'object' || checked.has(obj)) return null;
+  checked.add(obj);
   try {
-    const accounts = window.msal.getAllAccounts();
-    if (accounts.length > 0) {
-      window.msal.acquireTokenSilent({
-        account: accounts[0],
-        scopes: ['https://substrate.office.com/sydney/.default']
-      }).catch(() => {});
+    if (typeof obj.acquireTokenSilent === 'function' && typeof obj.getAllAccounts === 'function') return obj;
+    if (depth < 3) for (const k of Object.keys(obj)) {
+      try { const r = findMsal(obj[k], depth + 1); if (r) return r; } catch(e) {}
     }
   } catch(e) {}
+  return null;
+}
+for (const k of Object.getOwnPropertyNames(window)) {
+  try { msal = findMsal(window[k], 0); if (msal) break; } catch(e) {}
 }
 
-return 'Interceptors installed and ' + cleared + ' access tokens cleared. MSAL should refresh automatically. Watch the console for the JSON output.';
+if (msal) {
+  const accounts = msal.getAllAccounts();
+  if (accounts.length > 0) {
+    try {
+      await msal.acquireTokenSilent({
+        account: accounts[0],
+        scopes: ['https://substrate.office.com/.default'],
+        forceRefresh: true
+      });
+    } catch(e) {}
+  }
+  return 'Token refresh triggered. Copy the JSON output above.';
+}
+return 'Interceptor installed but MSAL instance not found. Navigate within m365.cloud.microsoft to trigger a token refresh, then copy the JSON output.';
 })()
 ```
 
 </details>
 
-4. Watch the console for: `===== COPY THE COMPLETE JSON LINE BELOW =====`
-5. Copy the JSON output. It looks like this:
+4. The console will output: `===== COPY THE COMPLETE JSON BELOW =====`
+5. Copy the JSON output. It will look like this:
 
 ```json
-{"oid":"your-oid","tenant":"your-tenant","refresh_token":"your-refresh-token"}
+{
+  "oid": "your-oid",
+  "tenant": "your-tenant",
+  "refresh_token": "your-refresh-token",
+  "sso_cookies": [
+    {"name": "ESTSAUTH", "value": "..."},
+    {"name": "ESTSAUTHPERSISTENT", "value": "..."}
+  ]
+}
 ```
 
-#### Step 4 (Optional): Get SSO cookies for automatic renewal
+> **Note:** SSO cookies are captured automatically if the `cookieStore` API is available (Chrome, Edge). If `sso_cookies` is missing from the output, see Step 4 below.
+
+#### Step 4 (Optional): Get SSO cookies manually
+
+If the script above did not capture SSO cookies automatically (e.g. Firefox, or third-party cookie restrictions), capture them manually:
 
 Microsoft SPA refresh tokens expire after **24 hours**. Without SSO cookies, you must repeat Step 3 every 24 hours. SSO cookies enable automatic renewal and last weeks/months.
 
@@ -198,7 +219,7 @@ To capture SSO cookies:
 
 #### Step 5: Create setup.json
 
-Create a file at `data/setup.json` with the JSON from Step 3. If you captured SSO cookies in Step 4, add them to the `sso_cookies` array:
+Create a file at `data/setup.json` with the JSON from Step 3. If you captured SSO cookies manually in Step 4, add them to the `sso_cookies` array:
 
 **Without SSO cookies (must re-run setup every 24 hours):**
 
@@ -227,6 +248,7 @@ Run the setup wizard inside the container to encrypt and save your credentials:
 ```bash
 docker exec -it m365bridge ./bin/m365-bridge setup-wizard
 ```
+
 
 The wizard will:
 - Read `data/setup.json`
