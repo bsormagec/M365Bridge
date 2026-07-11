@@ -1,9 +1,38 @@
 package payload
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 )
+
+func TestBuildURLUsesEduStarterRoute(t *testing.T) {
+	raw, _, _, err := BuildURL(
+		"token",
+		"0123456789abcdef0123456789abcdef",
+		"",
+		"user",
+		"tenant",
+	)
+	if err != nil {
+		t.Fatalf("BuildURL returned error: %v", err)
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("BuildURL returned invalid URL: %v", err)
+	}
+	query := parsed.Query()
+	if got := query.Get("licenseType"); got != "Starter" {
+		t.Fatalf("licenseType = %q, want Starter", got)
+	}
+	if got := query.Get("isEdu"); got != "true" {
+		t.Fatalf("isEdu = %q, want true", got)
+	}
+	if got := query.Get("scenario"); got != "OfficeWebIncludedCopilot" {
+		t.Fatalf("scenario = %q, want OfficeWebIncludedCopilot", got)
+	}
+}
 
 func TestConversationTextForM365IncludesClientHistoryWhenRequested(t *testing.T) {
 	messages := []Message{

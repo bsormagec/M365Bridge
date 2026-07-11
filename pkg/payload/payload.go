@@ -300,7 +300,7 @@ func BuildURL(token, hexSID, conversationID, userOID, tenantID string) (string, 
 	url += fmt.Sprintf("&access_token=%s", token)
 	url += fmt.Sprintf("&variants=%s", variants)
 	url += "&source=%22officeweb%22&product=Office&agentHost=Bizchat.FullScreen"
-	url += "&licenseType=Starter&isEdu=false&agent=web&scenario=OfficeWebIncludedCopilot"
+	url += "&licenseType=Starter&isEdu=true&agent=web&scenario=OfficeWebIncludedCopilot"
 
 	return url, hexSID, uuidSID, nil
 }
