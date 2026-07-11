@@ -5,6 +5,27 @@ All notable changes to M365Bridge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [1.3.0] - 2026-07-11
+
+### Added
+- Add Claude Fable and GPT-5.6 reasoning model support
+- Add opt-in built-in coding tools
+- Add M365 conversation management support
+- Add the Anthropic token counting endpoint
+- Improve SSO extraction and broker redirect handling
+- Support Anthropic system content blocks
+
+### Changed
+- Apply project-wide Go lint fixes
+- Filter setup tokens by client ID
+- Clean up API diagnostics
+
+### Fixed
+- Summarize broker authorization errors
+- Isolate image generation conversations
+- Reacquire expired designer broker tokens
+
 ## [1.2.2] - 2026-07-08
 
 ### Added
