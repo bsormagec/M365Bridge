@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
@@ -28,8 +29,9 @@ const (
 )
 
 func main() {
-	// Initialize dual-writer logger (stdout + data/proxy.log)
-	if err := logging.Init(logging.LevelWarn); err != nil {
+	// Initialize dual-writer logger (stdout + data/proxy.log). INFO is the
+	// useful default for Docker logs; set M365_LOG_LEVEL=debug for diagnostics.
+	if err := logging.Init(parseLogLevel(os.Getenv("M365_LOG_LEVEL"))); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
 		os.Exit(1)
 	}
@@ -50,6 +52,19 @@ func main() {
 
 	// Default: CLI mode
 	runCLI()
+}
+
+func parseLogLevel(value string) logging.LogLevel {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "debug":
+		return logging.LevelDebug
+	case "warn", "warning":
+		return logging.LevelWarn
+	case "error":
+		return logging.LevelError
+	default:
+		return logging.LevelInfo
+	}
 }
 
 // runServer starts the HTTP API server.

@@ -3,6 +3,9 @@ services:
     build: .
     image: ghcr.io/kilimcininkoroglu/m365bridge:latest
     container_name: m365bridge
+    environment:
+      # debug, info (default), warn, or error
+      M365_LOG_LEVEL: ${M365_LOG_LEVEL:-info}
     ports:
       - "8230:8000"
     volumes:
