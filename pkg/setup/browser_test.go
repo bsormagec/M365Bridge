@@ -10,15 +10,15 @@ func TestFilterBrowserCookiesSeparatesAllowedDomains(t *testing.T) {
 	cookies := filterBrowserCookies([]browserCookie{
 		{Name: "ESTSAUTH", Value: "first", Domain: ".login.microsoftonline.com", Secure: true, HTTPOnly: true},
 		{Name: "ESTSAUTHPERSISTENT", Value: "second", Domain: "login.microsoftonline.com"},
-		{Name: "OtherMicrosoftCookie", Value: "exclude", Domain: "login.microsoftonline.com"},
+		{Name: "OtherMicrosoftCookie", Value: "keep", Domain: "login.microsoftonline.com"},
 		{Name: "M365Session", Value: "third", Domain: "m365.cloud.microsoft"},
 		{Name: "ESTSAUTH", Value: "exclude", Domain: "office.com"},
 	})
 
-	if len(cookies) != 3 {
-		t.Fatalf("expected three allowed browser cookies, got %d", len(cookies))
+	if len(cookies) != 4 {
+		t.Fatalf("expected four allowed browser cookies, got %d", len(cookies))
 	}
-	if cookies[0].Name != "ESTSAUTH" || cookies[1].Name != "ESTSAUTHPERSISTENT" || cookies[2].Name != "M365Session" {
+	if cookies[0].Name != "ESTSAUTH" || cookies[1].Name != "ESTSAUTHPERSISTENT" || cookies[2].Name != "OtherMicrosoftCookie" || cookies[3].Name != "M365Session" {
 		t.Fatalf("unexpected cookies: %#v", cookies)
 	}
 }

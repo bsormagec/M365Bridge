@@ -154,6 +154,21 @@ func TestSummarizeBrokerAuthorizeResponseUsesTitleFallback(t *testing.T) {
 	}
 }
 
+func TestSummarizeBrokerAuthorizeResponseRecognizesJavaScriptRequirement(t *testing.T) {
+	body := `<html><head><title>Something went wrong</title></head><body>
+<div>We can't sign you in</div>
+<div>JavaScript is required to sign in. Your browser either does not support JavaScript or it is being blocked.</div>
+</body></html>`
+
+	summary := summarizeBrokerAuthorizeResponse(body)
+	if !strings.Contains(summary, "requires JavaScript") || !strings.Contains(summary, "setup-wizard --browser") {
+		t.Fatalf("unexpected JavaScript-required summary: %q", summary)
+	}
+	if strings.Contains(summary, "<html") {
+		t.Fatalf("summary leaked HTML: %q", summary)
+	}
+}
+
 func writeM365Cookies(t *testing.T, cookies []SSOCookie) {
 	t.Helper()
 	data, err := json.Marshal(map[string]any{

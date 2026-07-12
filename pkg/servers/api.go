@@ -218,9 +218,13 @@ func (api *APIServer) runTokenRefresher() {
 			logging.Debug("Token refresher: starting periodic refresh")
 			if _, err := api.tokenManager.Refresh(); err != nil {
 				logging.Errorf("Background token refresh failed: %v", err)
-			} else {
-				logging.Info("Background token refresh succeeded")
+				if errors.Is(err, auth.ErrBrowserReauthenticationRequired) {
+					logging.Error("Token refresher paused: rerun setup-wizard --browser, then restart the service")
+					return
+				}
+				continue
 			}
+			logging.Info("Background token refresh succeeded")
 			// Refresh designer token to keep broker RT rotated
 			if _, err := api.tokenManager.GetDesignerToken(); err != nil {
 				logging.Errorf("Background designer token refresh failed: %v", err)

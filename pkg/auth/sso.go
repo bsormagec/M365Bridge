@@ -38,6 +38,10 @@ const (
 // ErrM365CookiesUnavailable indicates that no cookies for the M365 web app are stored.
 var ErrM365CookiesUnavailable = errors.New("M365 web app cookies unavailable")
 
+// ErrBrowserReauthenticationRequired indicates that Microsoft's authorize
+// flow requires JavaScript and the stored browser session must be renewed.
+var ErrBrowserReauthenticationRequired = errors.New("browser reauthentication required")
+
 // SSOCookie represents a browser cookie used by M365 authentication or web APIs.
 type SSOCookie struct {
 	Name     string `json:"name"`
@@ -295,10 +299,11 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 			if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
 				location = metaURL
 			} else {
-				if len(bodyStr) > 2000 {
-					bodyStr = bodyStr[:2000]
+				summary := summarizeBrokerAuthorizeResponse(bodyStr)
+				if strings.Contains(strings.ToLower(summary), "requires javascript") {
+					return "", fmt.Errorf("%w: %s", ErrBrowserReauthenticationRequired, summary)
 				}
-				return "", fmt.Errorf("%w: no redirect from authorize (status %d): %s", ErrRefreshFailed, currentResp.StatusCode, bodyStr)
+				return "", fmt.Errorf("%w: no redirect from authorize (status %d): %s", ErrRefreshFailed, currentResp.StatusCode, summary)
 			}
 		}
 
@@ -393,6 +398,12 @@ func extractMetaRefreshURL(html string) string {
 }
 
 func summarizeBrokerAuthorizeResponse(body string) string {
+	lowerBody := strings.ToLower(body)
+	if strings.Contains(lowerBody, "javascript is required to sign in") ||
+		strings.Contains(lowerBody, "login.microsoftonline.com/jsdisabled") {
+		return "Microsoft sign-in requires JavaScript; rerun setup-wizard --browser to renew the browser session"
+	}
+
 	const aadSTSMarker = "AADSTS"
 	if start := strings.Index(body, aadSTSMarker); start >= 0 {
 		details := body[start:]
@@ -404,7 +415,6 @@ func summarizeBrokerAuthorizeResponse(body string) string {
 		}
 	}
 
-	lowerBody := strings.ToLower(body)
 	if titleStart := strings.Index(lowerBody, "<title>"); titleStart >= 0 {
 		contentStart := titleStart + len("<title>")
 		if titleEnd := strings.Index(lowerBody[contentStart:], "</title>"); titleEnd >= 0 {
@@ -773,7 +783,11 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 			if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
 				location = metaURL
 			} else {
-				return "", fmt.Errorf("no redirect from broker authorize (status %d, hop %d): %s", currentResp.StatusCode, i, summarizeBrokerAuthorizeResponse(bodyStr))
+				summary := summarizeBrokerAuthorizeResponse(bodyStr)
+				if strings.Contains(strings.ToLower(summary), "requires javascript") {
+					return "", fmt.Errorf("%w: %s", ErrBrowserReauthenticationRequired, summary)
+				}
+				return "", fmt.Errorf("no redirect from broker authorize (status %d, hop %d): %s", currentResp.StatusCode, i, summary)
 			}
 		}
 

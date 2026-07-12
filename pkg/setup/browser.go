@@ -641,7 +641,10 @@ func filterBrowserCookies(cookies []browserCookie) []auth.SSOCookie {
 	filtered := make([]auth.SSOCookie, 0, len(cookies))
 	for _, cookie := range cookies {
 		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
-		isLoginSSO := domain == "login.microsoftonline.com" && (cookie.Name == "ESTSAUTH" || cookie.Name == "ESTSAUTHPERSISTENT")
+		// Modern Entra sign-in can require routing/session cookies in addition to
+		// ESTSAUTH and ESTSAUTHPERSISTENT. Store all cookies scoped exactly to the
+		// login host; the resulting store is encrypted by SaveSSOCookies.
+		isLoginSSO := domain == "login.microsoftonline.com"
 		isM365WebCookie := domain == "m365.cloud.microsoft"
 		if !isLoginSSO && !isM365WebCookie {
 			continue
