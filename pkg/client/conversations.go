@@ -92,10 +92,14 @@ func (c *ConversationClient) DeleteConversation(ctx context.Context, conversatio
 func (c *ConversationClient) loadConversationState(ctx context.Context) (conversationPageState, error) {
 	var response conversationListResponse
 	body := map[string]any{
-		"action":                    "RefreshNavPane",
+		"action":                    "GetConversationPageHistoryList",
 		"conversationHistoryFilter": nil,
-		"skipNotebooks":             false,
-		"skipAgentListCache":        true,
+		"enableLastMessage":         true,
+		"syncState":                 nil,
+		"state": map[string]any{
+			"conversationPageHistoryList": nil,
+			"agentList":                   nil,
+		},
 	}
 	if err := c.request(ctx, body, &response); err != nil {
 		return conversationPageState{}, err
