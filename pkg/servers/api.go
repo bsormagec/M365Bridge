@@ -2950,8 +2950,16 @@ func responsesResultEmpty(text string, toolCalls []client.ToolCall) bool {
 	return strings.TrimSpace(text) == "" && len(toolCalls) == 0
 }
 
-var responsesEmptyRetryDelays = []time.Duration{
+var responsesPlainEmptyRetryDelays = []time.Duration{
 	250 * time.Millisecond,
+	750 * time.Millisecond,
+}
+
+func responsesEmptyRetrySchedule(simulateTools bool) []time.Duration {
+	if simulateTools {
+		return responsesPlainEmptyRetryDelays[:1]
+	}
+	return responsesPlainEmptyRetryDelays
 }
 
 type responsesConversationResult struct {
@@ -3723,7 +3731,7 @@ func (api *APIServer) responsesConversation(
 	return responsesConversationWithEmptyRetry(
 		ctx,
 		conversationID,
-		responsesEmptyRetryDelays,
+		responsesEmptyRetrySchedule(simulateTools),
 		onRetry,
 		func(
 			callContext context.Context,
@@ -3939,7 +3947,7 @@ func (api *APIServer) streamResponses(
 	ch := responsesStreamWithEmptyRetry(
 		ctx,
 		convID,
-		responsesEmptyRetryDelays,
+		responsesEmptyRetrySchedule(toolPolicy.simulate),
 		toolPolicy.simulate,
 		func() {
 			if sid != "" {

@@ -827,11 +827,17 @@ func TestResponsesResultRequiresVisibleOutput(t *testing.T) {
 	}
 }
 
-func TestResponsesEmptyRetryBudgetIsSingleFreshAttempt(t *testing.T) {
-	if len(responsesEmptyRetryDelays) != 1 {
+func TestResponsesEmptyRetryBudgetDependsOnSimulation(t *testing.T) {
+	if got := len(responsesEmptyRetrySchedule(false)); got != 2 {
 		t.Fatalf(
-			"empty retry delays = %d, want exactly one retry",
-			len(responsesEmptyRetryDelays),
+			"plain empty retry delays = %d, want two retries",
+			got,
+		)
+	}
+	if got := len(responsesEmptyRetrySchedule(true)); got != 1 {
+		t.Fatalf(
+			"simulated empty retry delays = %d, want one retry",
+			got,
 		)
 	}
 }
@@ -899,6 +905,34 @@ func TestResponsesConversationEmptyRetryIsBounded(t *testing.T) {
 	}
 	if attempts != 2 {
 		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestResponsesConversationRecoversOnSecondEmptyRetry(t *testing.T) {
+	attempts := 0
+
+	result, err := responsesConversationWithEmptyRetry(
+		context.Background(),
+		"",
+		[]time.Duration{0, 0},
+		nil,
+		func(_ context.Context, _ string) (responsesConversationResult, error) {
+			attempts++
+			if attempts < 3 {
+				return responsesConversationResult{}, nil
+			}
+			return responsesConversationResult{text: "recovered"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("second empty retry failed: %v", err)
+	}
+	if result.text != "recovered" || attempts != 3 {
+		t.Fatalf(
+			"second retry result = %#v after %d attempts",
+			result,
+			attempts,
+		)
 	}
 }
 
