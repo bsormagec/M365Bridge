@@ -3,15 +3,11 @@
 package servers
 
 import (
-	"bufio"
 	"fmt"
-	"os"
-	"strings"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
-	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 )
 
 // CLIServer handles command-line interface operations.
@@ -72,62 +68,7 @@ func (cli *CLIServer) listModels() error {
 
 // runInteractive starts the interactive mode.
 func (cli *CLIServer) runInteractive(options *CLIOptions) error {
-	fmt.Printf("M365 Copilot v%s (Interactive Mode)\n", models.Version)
-	fmt.Printf("Model: %s\n", options.Model)
-	fmt.Println("Exit: Ctrl+C")
-
-	reader := bufio.NewReader(os.Stdin)
-	conversationID := ""
-
-	for {
-		fmt.Print("\n> ")
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			return fmt.Errorf("failed to read input: %w", err)
-		}
-
-		text := strings.TrimSpace(input)
-		if text == "" {
-			continue
-		}
-
-		cfg := models.LookupModel(options.Model)
-		tone := cfg.Tone
-		if options.Reasoning {
-			tone = "Reasoning"
-		}
-
-		if options.NoStream {
-			result, _, _, _, nextConversationID, chatErr := cli.m365Client.ChatConversation(
-				[]payload.Message{{Role: "user", Content: text}},
-				tone,
-				cfg.Override,
-				conversationID,
-				cli.config.UserOID,
-				cli.config.TenantID,
-				false,
-			)
-			err = chatErr
-			if chatErr == nil && nextConversationID != "" {
-				conversationID = nextConversationID
-			}
-			if err == nil && result != "" {
-				fmt.Println(result)
-			}
-		} else {
-			fmt.Println()
-			_, nextConversationID, err := cli.streamToStdout(text, tone, cfg.Override, conversationID)
-			if err == nil && nextConversationID != "" {
-				conversationID = nextConversationID
-			}
-			fmt.Println()
-		}
-
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
-			continue
-		}
-	}
+	return runChatTUI(cli, options)
 }
 
 // runSingleQuery executes a single query and prints the result.

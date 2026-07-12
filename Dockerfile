@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 ARG VERSION=dev
 
@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 go build -ldflags "-X github.com/KilimcininKorOglu/M365Bridge/
 # Runtime stage
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates git go tzdata
+RUN apk add --no-cache ca-certificates git tzdata
 
 WORKDIR /app
 

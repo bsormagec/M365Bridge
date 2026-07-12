@@ -15,7 +15,7 @@ Uygulamanız -> M365Bridge -> substrate.office.com (SignalR) -> M365 Copilot Bac
 
 ## Ön Koşullar
 
-- **Go 1.22+** kurulu ([indir](https://go.dev/dl/))
+- **Go 1.25+** kurulu ([indir](https://go.dev/dl/))
 - Bu repoyu klonlamak için **git**
 - **Microsoft 365 Copilot lisansı** (iş veya kurumsal hesap, Copilot erişimi olan) test edilmiş copilot chat (temel) hesabı
 - [https://m365.cloud.microsoft](https://m365.cloud.microsoft) adresine giriş yapmış bir tarayıcı (kurulum sihirbazı token çıkarımı için)
@@ -818,7 +818,7 @@ pkg/
     api.go               # HTTP API sunucusu, tüm uç noktalar, max_tokens, token sayımı, oturum izolasyonu
     cli.go               # CLI sunucusu, etkileşimli mod
   setup/wizard.go        # Tarayıcı tabanlı kurulum sihirbazı (JS kod parçacığı, token doğrulama, data/.env kaydı)
-go.mod                   # Modül: github.com/KilimcininKorOglu/M365Bridge, Go 1.22
+go.mod                   # Modül: github.com/KilimcininKorOglu/M365Bridge, Go 1.25
 data/                    # Çalışma zamanı verisi (gitignore'lı): tokens/, setup.json, cache/
 ```
 

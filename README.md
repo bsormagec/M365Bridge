@@ -15,7 +15,7 @@ Your App -> M365Bridge -> substrate.office.com (SignalR) -> M365 Copilot Backend
 
 ## Prerequisites
 
-- **Go 1.22+** installed ([download](https://go.dev/dl/))
+- **Go 1.25+** installed ([download](https://go.dev/dl/))
 - **git** for cloning this repository
 - A **Microsoft 365 Copilot license** (business or enterprise account with Copilot access) tested a copilot chat (basic) account
 - A browser logged into [https://m365.cloud.microsoft](https://m365.cloud.microsoft) (for setup wizard token extraction)
@@ -826,7 +826,7 @@ pkg/
     api.go               # HTTP API server, all endpoints, max_tokens, token counting, session isolation
     cli.go               # CLI server, interactive mode
   setup/wizard.go        # Browser-based setup wizard (JS snippet, token verify, data/.env save)
-go.mod                   # Module: github.com/KilimcininKorOglu/M365Bridge, Go 1.22
+go.mod                   # Module: github.com/KilimcininKorOglu/M365Bridge, Go 1.25
 data/                    # Runtime data (gitignored): tokens/, setup.json, cache/
 ```
 
