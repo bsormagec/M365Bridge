@@ -1,7 +1,6 @@
 package servers
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -52,7 +51,7 @@ func TestResponsesToolPolicy(t *testing.T) {
 	tools := responsesTestTools()
 	tests := []struct {
 		name         string
-		choice       any
+		choice       interface{}
 		wantSimulate bool
 		wantRequired bool
 		wantName     string
@@ -63,7 +62,7 @@ func TestResponsesToolPolicy(t *testing.T) {
 		{name: "none", choice: "none", wantSimulate: false},
 		{
 			name:         "named",
-			choice:       map[string]any{"type": "function", "name": "read_nonce"},
+			choice:       map[string]interface{}{"type": "function", "name": "read_nonce"},
 			wantSimulate: true,
 			wantRequired: true,
 			wantName:     "read_nonce",
@@ -92,7 +91,7 @@ func TestResponsesToolPolicy(t *testing.T) {
 func TestResponsesToolPolicyRejectsUnknownNamedTool(t *testing.T) {
 	_, err := newResponsesToolPolicy(
 		responsesTestTools(),
-		map[string]any{"type": "function", "name": "invented_tool"},
+		map[string]interface{}{"type": "function", "name": "invented_tool"},
 	)
 	if err == nil {
 		t.Fatal("expected unknown named tool to be rejected")
@@ -104,7 +103,7 @@ func TestResponsesToolPolicyAcceptsBuiltInToolType(t *testing.T) {
 
 	policy, err := newResponsesToolPolicy(
 		tools,
-		map[string]any{"type": "tool_search"},
+		map[string]interface{}{"type": "tool_search"},
 	)
 	if err != nil {
 		t.Fatalf("built-in Responses tool rejected: %v", err)
@@ -143,7 +142,7 @@ func TestParseResponsesSimulationRequiredRejectsPlainContent(t *testing.T) {
 func TestParseResponsesSimulationWithRetryAcceptsRequiredToolCall(t *testing.T) {
 	policy, err := newResponsesToolPolicy(
 		responsesTestTools(),
-		map[string]any{"type": "function", "name": "read_nonce"},
+		map[string]interface{}{"type": "function", "name": "read_nonce"},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -160,7 +159,6 @@ func TestParseResponsesSimulationWithRetryAcceptsRequiredToolCall(t *testing.T) 
 			retries++
 			return simulatedToolCallEnvelope("read_nonce"), nil
 		},
-		nil,
 	)
 	if err != nil {
 		t.Fatalf("required tool retry failed: %v", err)
@@ -177,7 +175,7 @@ func TestParseResponsesSimulationWithRetryAcceptsRequiredToolCall(t *testing.T) 
 func TestParseResponsesSimulationWithRetryAllowsSecondRetry(t *testing.T) {
 	policy, err := newResponsesToolPolicy(
 		responsesTestTools(),
-		map[string]any{"type": "function", "name": "read_nonce"},
+		map[string]interface{}{"type": "function", "name": "read_nonce"},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -197,7 +195,6 @@ func TestParseResponsesSimulationWithRetryAllowsSecondRetry(t *testing.T) {
 			}
 			return simulatedToolCallEnvelope("read_nonce"), nil
 		},
-		nil,
 	)
 	if err != nil {
 		t.Fatalf("second required tool retry failed: %v", err)
@@ -211,44 +208,10 @@ func TestParseResponsesSimulationWithRetryAllowsSecondRetry(t *testing.T) {
 	}
 }
 
-func TestParseResponsesSimulationWithRetryRetriesEmptyAutoResult(t *testing.T) {
-	policy, err := newResponsesToolPolicy(responsesTestTools(), "auto")
-	if err != nil {
-		t.Fatal(err)
-	}
-	empty := "```json\n" +
-		`{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[]},"finish_reason":"stop"}]}` +
-		"\n```"
-	retries := 0
-
-	result, err := parseResponsesSimulationWithRetry(
-		empty,
-		policy,
-		nil,
-		func() (string, error) {
-			retries++
-			return "```json\n" +
-					`{"choices":[{"message":{"role":"assistant","content":"recovered"},"finish_reason":"stop"}]}` +
-					"\n```",
-				nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("empty auto simulation retry failed: %v", err)
-	}
-	if retries != 1 || result.content != "recovered" {
-		t.Fatalf(
-			"empty auto retry result = %#v after %d retries",
-			result,
-			retries,
-		)
-	}
-}
-
 func TestParseResponsesSimulationNamedRejectsWrongDeclaredTool(t *testing.T) {
 	policy, err := newResponsesToolPolicy(
 		responsesTestTools(),
-		map[string]any{"type": "function", "name": "read_nonce"},
+		map[string]interface{}{"type": "function", "name": "read_nonce"},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -360,7 +323,7 @@ func TestBuildResponsesObjectPlacesCommentaryBeforeToolCall(t *testing.T) {
 		1,
 		0,
 	)
-	output, ok := response["output"].([]map[string]any)
+	output, ok := response["output"].([]map[string]interface{})
 	if !ok {
 		t.Fatalf("response output has unexpected type: %T", response["output"])
 	}
@@ -401,7 +364,7 @@ func TestBuildResponsesToolCallItemUsesDeclaredBuiltInType(t *testing.T) {
 	if item["execution"] != "client" {
 		t.Fatalf("tool_search execution = %#v", item["execution"])
 	}
-	if _, ok := item["arguments"].(map[string]any); !ok {
+	if _, ok := item["arguments"].(map[string]interface{}); !ok {
 		t.Fatalf("tool_search arguments are not a JSON object: %#v", item["arguments"])
 	}
 }
@@ -455,14 +418,14 @@ func TestBuildResponsesToolCallItemIncludesEmptyArgumentsWhileInProgress(t *test
 }
 
 func TestMergeLoadedResponsesTools(t *testing.T) {
-	input := []any{
-		map[string]any{
+	input := []interface{}{
+		map[string]interface{}{
 			"type": "tool_search_output",
-			"tools": []any{
-				map[string]any{
+			"tools": []interface{}{
+				map[string]interface{}{
 					"type": "namespace",
-					"tools": []any{
-						map[string]any{
+					"tools": []interface{}{
+						map[string]interface{}{
 							"type": "function",
 							"name": "node_repl",
 						},
@@ -483,22 +446,22 @@ func TestMergeLoadedResponsesTools(t *testing.T) {
 }
 
 func TestMergeLoadedResponsesToolsPreservesDuplicateNamespacedTools(t *testing.T) {
-	input := []any{
-		map[string]any{
+	input := []interface{}{
+		map[string]interface{}{
 			"type": "tool_search_output",
-			"tools": []any{
-				map[string]any{
+			"tools": []interface{}{
+				map[string]interface{}{
 					"type": "namespace",
 					"name": "mcp__node_repl",
-					"tools": []any{
-						map[string]any{"type": "function", "name": "js"},
+					"tools": []interface{}{
+						map[string]interface{}{"type": "function", "name": "js"},
 					},
 				},
-				map[string]any{
+				map[string]interface{}{
 					"type": "namespace",
 					"name": "mcp__browser",
-					"tools": []any{
-						map[string]any{"type": "function", "name": "js"},
+					"tools": []interface{}{
+						map[string]interface{}{"type": "function", "name": "js"},
 					},
 				},
 			},
@@ -553,21 +516,21 @@ func TestParseResponsesSimulationRejectsAmbiguousUnqualifiedNamespace(t *testing
 }
 
 func TestResponsesInputPreservesToolSearchAndCompactionHistory(t *testing.T) {
-	input := []any{
-		map[string]any{
+	input := []interface{}{
+		map[string]interface{}{
 			"type":      "tool_search_call",
-			"arguments": map[string]any{"query": "node repl"},
+			"arguments": map[string]interface{}{"query": "node repl"},
 		},
-		map[string]any{
+		map[string]interface{}{
 			"type": "tool_search_output",
-			"tools": []any{
-				map[string]any{
+			"tools": []interface{}{
+				map[string]interface{}{
 					"type": "function",
 					"name": "node_repl",
 				},
 			},
 		},
-		map[string]any{
+		map[string]interface{}{
 			"type":              "compaction",
 			"encrypted_content": "Earlier work summary",
 		},
@@ -590,8 +553,8 @@ func TestResponsesInputPreservesToolSearchAndCompactionHistory(t *testing.T) {
 }
 
 func TestResponsesFunctionCallOutputBecomesAuthoritativeToolHistory(t *testing.T) {
-	messages := responsesInputToMessages([]any{
-		map[string]any{
+	messages := responsesInputToMessages([]interface{}{
+		map[string]interface{}{
 			"type":    "function_call_output",
 			"call_id": "call_nonce",
 			"output":  "NONCE-EXACT",
@@ -619,37 +582,37 @@ func TestResponsesFunctionCallOutputBecomesAuthoritativeToolHistory(t *testing.T
 }
 
 func TestResponsesInputPreservesNamespacedToolState(t *testing.T) {
-	namespacedTools := []any{
-		map[string]any{
+	namespacedTools := []interface{}{
+		map[string]interface{}{
 			"type": "namespace",
 			"name": "mcp__node_repl",
-			"tools": []any{
-				map[string]any{
+			"tools": []interface{}{
+				map[string]interface{}{
 					"type": "function",
 					"name": "js",
-					"parameters": map[string]any{
+					"parameters": map[string]interface{}{
 						"type": "object",
 					},
 				},
 			},
 		},
 	}
-	input := []any{
-		map[string]any{
+	input := []interface{}{
+		map[string]interface{}{
 			"type":  "tool_search_output",
 			"tools": namespacedTools,
 		},
-		map[string]any{
+		map[string]interface{}{
 			"type":  "additional_tools",
 			"tools": namespacedTools,
 		},
-		map[string]any{
+		map[string]interface{}{
 			"type":      "function_call",
 			"namespace": "mcp__node_repl",
 			"name":      "js",
 			"arguments": `{"code":"1+1"}`,
 		},
-		map[string]any{
+		map[string]interface{}{
 			"type":    "function_call_output",
 			"call_id": "call_js",
 			"output":  "2",
@@ -797,11 +760,11 @@ func TestWriteResponsesSimulationErrorNonStreaming(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
 	}
-	var body map[string]any
+	var body map[string]interface{}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("invalid JSON body: %v", err)
 	}
-	errorObject, _ := body["error"].(map[string]any)
+	errorObject, _ := body["error"].(map[string]interface{})
 	if errorObject["code"] != simulatedToolCallRequiredCode {
 		t.Fatalf("error code = %#v, want %q", errorObject["code"], simulatedToolCallRequiredCode)
 	}
@@ -821,27 +784,6 @@ func TestWriteResponsesSimulationErrorStreaming(t *testing.T) {
 	}
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("stream missing terminal marker:\n%s", body)
-	}
-}
-
-func TestBuildResponsesFailedEventIncludesSequenceNumber(t *testing.T) {
-	event := buildResponsesFailedEvent(
-		"resp_test",
-		"gpt-test",
-		"upstream_timeout",
-		"timed out",
-		7,
-	)
-	if got := event["sequence_number"]; got != 7 {
-		t.Fatalf("sequence_number = %#v, want 7", got)
-	}
-	response, ok := event["response"].(map[string]any)
-	if !ok {
-		t.Fatalf("response payload has wrong type: %#v", event["response"])
-	}
-	errorPayload, ok := response["error"].(map[string]any)
-	if !ok || errorPayload["code"] != "upstream_timeout" {
-		t.Fatalf("error payload mismatch: %#v", response["error"])
 	}
 }
 
@@ -866,438 +808,6 @@ func TestResponsesResultRequiresVisibleOutput(t *testing.T) {
 	}
 }
 
-func TestResponsesEmptyRetryBudgetDependsOnSimulation(t *testing.T) {
-	plain := responsesEmptyRetrySchedule(false)
-	if got := len(plain); got != 2 {
-		t.Fatalf(
-			"plain empty retry delays = %d, want two retries",
-			got,
-		)
-	}
-	if plain[0] != 10*time.Second || plain[1] != 30*time.Second {
-		t.Fatalf("plain retry schedule = %v, want [10s 30s]", plain)
-	}
-	simulated := responsesEmptyRetrySchedule(true)
-	if got := len(simulated); got != 1 {
-		t.Fatalf(
-			"simulated empty retry delays = %d, want one retry",
-			got,
-		)
-	}
-	if simulated[0] != 10*time.Second {
-		t.Fatalf("simulated retry schedule = %v, want [10s]", simulated)
-	}
-}
-
-func TestResponsesConversationRetriesEmptyCompletion(t *testing.T) {
-	attempts := 0
-	conversationIDs := []string{}
-	retryHooks := 0
-
-	result, err := responsesConversationWithEmptyRetry(
-		context.Background(),
-		"conv-poisoned",
-		[]time.Duration{0},
-		func() {
-			retryHooks++
-		},
-		func(_ context.Context, conversationID string) (responsesConversationResult, error) {
-			attempts++
-			conversationIDs = append(conversationIDs, conversationID)
-			if attempts == 1 {
-				return responsesConversationResult{}, nil
-			}
-			return responsesConversationResult{
-				text:           "recovered",
-				finishReason:   "stop",
-				conversationID: "conv-recovered",
-			}, nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("empty completion retry failed: %v", err)
-	}
-	if result.text != "recovered" {
-		t.Fatalf("retried text = %q, want recovered", result.text)
-	}
-	if attempts != 2 {
-		t.Fatalf("attempts = %d, want 2", attempts)
-	}
-	if retryHooks != 1 {
-		t.Fatalf("retry hooks = %d, want 1", retryHooks)
-	}
-	if got := strings.Join(conversationIDs, ","); got != "conv-poisoned," {
-		t.Fatalf("conversation IDs = %q, want poisoned then fresh", got)
-	}
-}
-
-func TestResponsesConversationEmptyRetryIsBounded(t *testing.T) {
-	attempts := 0
-
-	result, err := responsesConversationWithEmptyRetry(
-		context.Background(),
-		"",
-		[]time.Duration{0},
-		nil,
-		func(_ context.Context, _ string) (responsesConversationResult, error) {
-			attempts++
-			return responsesConversationResult{}, nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("bounded empty retry returned error: %v", err)
-	}
-	if !responsesResultEmpty(result.text, result.toolCalls) {
-		t.Fatalf("exhausted retry unexpectedly returned visible output: %#v", result)
-	}
-	if attempts != 2 {
-		t.Fatalf("attempts = %d, want 2", attempts)
-	}
-}
-
-func TestResponsesConversationRecoversOnSecondEmptyRetry(t *testing.T) {
-	attempts := 0
-
-	result, err := responsesConversationWithEmptyRetry(
-		context.Background(),
-		"",
-		[]time.Duration{0, 0},
-		nil,
-		func(_ context.Context, _ string) (responsesConversationResult, error) {
-			attempts++
-			if attempts < 3 {
-				return responsesConversationResult{}, nil
-			}
-			return responsesConversationResult{text: "recovered"}, nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("second empty retry failed: %v", err)
-	}
-	if result.text != "recovered" || attempts != 3 {
-		t.Fatalf(
-			"second retry result = %#v after %d attempts",
-			result,
-			attempts,
-		)
-	}
-}
-
-func TestResponsesStreamRetriesEmptyCompletionBeforeEmitting(t *testing.T) {
-	attempts := 0
-	conversationIDs := []string{}
-	retryHooks := 0
-
-	ch := responsesStreamWithEmptyRetry(
-		context.Background(),
-		"conv-poisoned",
-		[]time.Duration{0},
-		false,
-		func() {
-			retryHooks++
-		},
-		func(_ context.Context, conversationID string) <-chan client.StreamChunk {
-			attempts++
-			conversationIDs = append(conversationIDs, conversationID)
-			if attempts == 1 {
-				return responsesTestChunkStream(client.StreamChunk{
-					IsFinal:        true,
-					ConversationID: "conv-empty",
-					FinishReason:   "stop",
-				})
-			}
-			return responsesTestChunkStream(
-				client.StreamChunk{Text: "recovered"},
-				client.StreamChunk{
-					IsFinal:        true,
-					ConversationID: "conv-recovered",
-					FinishReason:   "stop",
-				},
-			)
-		},
-	)
-
-	chunks := []client.StreamChunk{}
-	for chunk := range ch {
-		chunks = append(chunks, chunk)
-	}
-	if attempts != 2 {
-		t.Fatalf("attempts = %d, want 2", attempts)
-	}
-	if retryHooks != 1 {
-		t.Fatalf("retry hooks = %d, want 1", retryHooks)
-	}
-	if got := strings.Join(conversationIDs, ","); got != "conv-poisoned," {
-		t.Fatalf("conversation IDs = %q, want poisoned then fresh", got)
-	}
-	if len(chunks) != 2 || chunks[0].Text != "recovered" ||
-		!chunks[1].IsFinal {
-		t.Fatalf("unexpected retried stream: %#v", chunks)
-	}
-}
-
-func TestResponsesStreamEmptyRetryStopsOnCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	attempts := 0
-
-	ch := responsesStreamWithEmptyRetry(
-		ctx,
-		"",
-		[]time.Duration{time.Hour},
-		false,
-		nil,
-		func(_ context.Context, _ string) <-chan client.StreamChunk {
-			attempts++
-			cancel()
-			return responsesTestChunkStream(client.StreamChunk{
-				IsFinal: true,
-			})
-		},
-	)
-
-	for range ch {
-	}
-	if attempts != 1 {
-		t.Fatalf("attempts after cancellation = %d, want 1", attempts)
-	}
-}
-
-func TestResponsesStreamDoesNotRetryAfterVisibleChunk(t *testing.T) {
-	attempts := 0
-
-	ch := responsesStreamWithEmptyRetry(
-		context.Background(),
-		"",
-		[]time.Duration{0, 0},
-		false,
-		nil,
-		func(_ context.Context, _ string) <-chan client.StreamChunk {
-			attempts++
-			return responsesTestChunkStream(
-				client.StreamChunk{Thinking: "working"},
-				client.StreamChunk{IsFinal: true},
-			)
-		},
-	)
-
-	chunks := []client.StreamChunk{}
-	for chunk := range ch {
-		chunks = append(chunks, chunk)
-	}
-	if attempts != 1 {
-		t.Fatalf("attempts = %d, want 1 after visible output", attempts)
-	}
-	if len(chunks) != 2 || chunks[0].Thinking != "working" ||
-		!chunks[1].IsFinal {
-		t.Fatalf("visible stream changed: %#v", chunks)
-	}
-}
-
-func TestResponsesStreamRetriesHiddenBackendToolCall(t *testing.T) {
-	attempts := 0
-	toolCall := client.ToolCall{
-		ID:   "call_test",
-		Type: "function",
-		Function: client.ToolCallFunction{
-			Name:      "read_nonce",
-			Arguments: `{}`,
-		},
-	}
-
-	ch := responsesStreamWithEmptyRetry(
-		context.Background(),
-		"",
-		[]time.Duration{0, 0},
-		false,
-		nil,
-		func(_ context.Context, _ string) <-chan client.StreamChunk {
-			attempts++
-			if attempts == 2 {
-				return responsesTestChunkStream(
-					client.StreamChunk{Text: "recovered"},
-					client.StreamChunk{IsFinal: true},
-				)
-			}
-			return responsesTestChunkStream(client.StreamChunk{
-				IsFinal:   true,
-				ToolCalls: []client.ToolCall{toolCall},
-			})
-		},
-	)
-
-	chunks := []client.StreamChunk{}
-	for chunk := range ch {
-		chunks = append(chunks, chunk)
-	}
-	if attempts != 2 {
-		t.Fatalf("attempts = %d, want hidden tool call to retry", attempts)
-	}
-	if len(chunks) != 2 || chunks[0].Text != "recovered" ||
-		!chunks[1].IsFinal {
-		t.Fatalf("hidden backend tool call escaped: %#v", chunks)
-	}
-}
-
-func TestResponsesStreamBufferedSimulationRetriesBeforePublishing(t *testing.T) {
-	attempts := 0
-
-	ch := responsesStreamWithEmptyRetry(
-		context.Background(),
-		"conv-poisoned",
-		[]time.Duration{0},
-		true,
-		nil,
-		func(_ context.Context, _ string) <-chan client.StreamChunk {
-			attempts++
-			if attempts == 1 {
-				return responsesTestChunkStream(
-					client.StreamChunk{Thinking: "hidden transport reasoning"},
-					client.StreamChunk{
-						IsFinal: true,
-						ToolCalls: []client.ToolCall{{
-							ID: "backend-only",
-						}},
-					},
-				)
-			}
-			return responsesTestChunkStream(
-				client.StreamChunk{Text: "recovered"},
-				client.StreamChunk{IsFinal: true},
-			)
-		},
-	)
-
-	chunks := []client.StreamChunk{}
-	for chunk := range ch {
-		chunks = append(chunks, chunk)
-	}
-	if attempts != 2 {
-		t.Fatalf("attempts = %d, want 2", attempts)
-	}
-	if len(chunks) != 2 || chunks[0].Text != "recovered" ||
-		chunks[0].Thinking != "" || !chunks[1].IsFinal {
-		t.Fatalf("buffered retry exposed discarded attempt: %#v", chunks)
-	}
-}
-
-func TestResponsesStreamSimulationPublishesTextBeforeFinal(t *testing.T) {
-	upstream := make(chan client.StreamChunk, 2)
-	ch := responsesStreamWithEmptyRetry(
-		context.Background(),
-		"",
-		nil,
-		true,
-		nil,
-		func(_ context.Context, _ string) <-chan client.StreamChunk {
-			return upstream
-		},
-	)
-
-	upstream <- client.StreamChunk{
-		Text: `{"choices":[{"message":{"content":"çalışıyor"}}`,
-	}
-
-	select {
-	case chunk := <-ch:
-		if chunk.Text == "" {
-			t.Fatalf("first streamed chunk had no text: %#v", chunk)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("simulated Responses text remained buffered until final")
-	}
-
-	upstream <- client.StreamChunk{IsFinal: true}
-	close(upstream)
-	for range ch {
-	}
-}
-
-func TestLimitResponsesStreamDeltaHonorsMaxTokens(t *testing.T) {
-	emitted, published, truncated := limitResponsesStreamDelta(
-		"",
-		"hello world",
-		1,
-	)
-	if emitted == "" || published != emitted || !truncated {
-		t.Fatalf(
-			"first limited delta = (%q, %q, %t)",
-			emitted,
-			published,
-			truncated,
-		)
-	}
-	if countTokens(published) > 1 {
-		t.Fatalf("published content exceeds token limit: %q", published)
-	}
-
-	emitted, next, truncated := limitResponsesStreamDelta(
-		published,
-		" ignored",
-		1,
-	)
-	if emitted != "" || next != published || !truncated {
-		t.Fatalf(
-			"post-limit delta = (%q, %q, %t)",
-			emitted,
-			next,
-			truncated,
-		)
-	}
-}
-
-func TestResponsesStreamWithoutFinalReturnsUpstreamError(t *testing.T) {
-	attempts := 0
-
-	ch := responsesStreamWithEmptyRetry(
-		context.Background(),
-		"",
-		[]time.Duration{0},
-		false,
-		nil,
-		func(_ context.Context, _ string) <-chan client.StreamChunk {
-			attempts++
-			return responsesTestChunkStream(client.StreamChunk{Text: "partial"})
-		},
-	)
-
-	chunks := []client.StreamChunk{}
-	for chunk := range ch {
-		chunks = append(chunks, chunk)
-	}
-	if attempts != 1 {
-		t.Fatalf("attempts = %d, want 1 for a broken stream", attempts)
-	}
-	if len(chunks) != 2 || chunks[0].Text != "partial" ||
-		chunks[1].Error == nil {
-		t.Fatalf("broken stream did not end with an error: %#v", chunks)
-	}
-}
-
-func TestCanceledResponsesRequestClearsStickySession(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	cache := NewContextCache(t.TempDir())
-	sid := "canceled-session"
-	cache.Set("session:"+sid, "conv-poisoned")
-	api := &APIServer{ctxCache: cache}
-
-	if !api.responsesRequestCanceled(ctx, sid) {
-		t.Fatal("canceled Responses request was not detected")
-	}
-	if got := cache.Get("session:" + sid); got != "" {
-		t.Fatalf("canceled Responses request kept sticky session %q", got)
-	}
-}
-
-func responsesTestChunkStream(chunks ...client.StreamChunk) <-chan client.StreamChunk {
-	ch := make(chan client.StreamChunk, len(chunks))
-	for _, chunk := range chunks {
-		ch <- chunk
-	}
-	close(ch)
-	return ch
-}
-
 func TestWriteResponsesUpstreamEmptyErrorNonStreaming(t *testing.T) {
 	rec := httptest.NewRecorder()
 
@@ -1306,11 +816,11 @@ func TestWriteResponsesUpstreamEmptyErrorNonStreaming(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
 	}
-	var body map[string]any
+	var body map[string]interface{}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("invalid JSON body: %v", err)
 	}
-	errorObject, _ := body["error"].(map[string]any)
+	errorObject, _ := body["error"].(map[string]interface{})
 	if errorObject["code"] != upstreamEmptyResponseCode {
 		t.Fatalf("error code = %#v, want %q", errorObject["code"], upstreamEmptyResponseCode)
 	}

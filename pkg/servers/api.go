@@ -3,7 +3,6 @@
 package servers
 
 import (
-	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
@@ -632,9 +631,9 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 		}
 		var simulated toolcalling.SimulatedResult
 		if provider == toolLoopAnthropic {
-			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools))
 		} else {
-			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools))
 		}
 		if !simulated.HasPayload || len(simulated.ToolCalls) == 0 {
 			if simulated.HasPayload {
@@ -1325,7 +1324,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -1506,7 +1505,7 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -1739,7 +1738,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -1938,7 +1937,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2122,7 +2121,7 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	// Parse simulated tool calls from buffered text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -2204,7 +2203,7 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 
 	// Parse simulated tool calls from response text
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2390,7 +2389,7 @@ func (api *APIServer) sendAnthropicSSE(w http.ResponseWriter, eventType string, 
 func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convID string) {
 	// Find the last message with images
 	lastImgIdx := -1
-	for i := range slices.Backward(*messages) {
+	for i := len(*messages) - 1; i >= 0; i-- {
 		if len((*messages)[i].Images) > 0 {
 			lastImgIdx = i
 			break
@@ -2459,7 +2458,7 @@ func chatAnthropicThinkingForOutput(thinking string, simulated bool) string {
 
 	var output []string
 	inFence := false
-	for line := range strings.SplitSeq(thinking, "\n") {
+	for _, line := range strings.Split(thinking, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "```") {
 			inFence = !inFence
@@ -2482,13 +2481,12 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice 
 		return
 	}
 	prompt := toolcalling.BuildSimulatedPrompt(requestJSON, true, toolChoice)
-	for i := range slices.Backward(*messages) {
+	for i := len(*messages) - 1; i >= 0; i-- {
 		if (*messages)[i].Role == "user" {
-			suffix := ""
 			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
-				suffix = "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
+				prompt += "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
 			}
-			(*messages)[i].Content = prompt + suffix
+			(*messages)[i].Content = prompt
 			break
 		}
 	}
@@ -2516,13 +2514,12 @@ func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, to
 		return
 	}
 	prompt := toolcalling.BuildSimulatedPromptAnthropic(requestJSON, true, toolChoice)
-	for i := range slices.Backward(*messages) {
+	for i := len(*messages) - 1; i >= 0; i-- {
 		if (*messages)[i].Role == "user" {
-			suffix := ""
 			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
-				suffix = "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
+				prompt += "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
 			}
-			(*messages)[i].Content = prompt + suffix
+			(*messages)[i].Content = prompt
 			break
 		}
 	}
@@ -2579,7 +2576,7 @@ type responsesSimulationResult struct {
 	finishReason string
 }
 
-func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice any) (responsesToolPolicy, error) {
+func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice interface{}) (responsesToolPolicy, error) {
 	allNames := responsesToolNames(tools)
 	knownNames := make(map[string]bool, len(tools))
 	for _, name := range allNames {
@@ -2616,11 +2613,11 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice any) (respon
 			policy.promptChoice = choice
 			policy.allowedToolNames = []string{choice}
 		}
-	case map[string]any:
+	case map[string]interface{}:
 		name, _ := choice["name"].(string)
 		choiceType, _ := choice["type"].(string)
 		if name == "" {
-			if function, ok := choice["function"].(map[string]any); ok {
+			if function, ok := choice["function"].(map[string]interface{}); ok {
 				name, _ = function["name"].(string)
 			}
 		}
@@ -2640,10 +2637,10 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice any) (respon
 	}
 
 	if policy.simulate && len(policy.allowedToolNames) == 0 {
-		return responsesToolPolicy{}, errors.New("responses tools must include at least one function name")
+		return responsesToolPolicy{}, errors.New("Responses tools must include at least one function name")
 	}
 	if policy.required && !policy.simulate {
-		return responsesToolPolicy{}, errors.New("responses tool_choice requires at least one tool")
+		return responsesToolPolicy{}, errors.New("Responses tool_choice requires at least one tool")
 	}
 	return policy, nil
 }
@@ -2693,18 +2690,18 @@ func responsesToolTypes(tools []toolcalling.ToolDef) map[string]string {
 	return types
 }
 
-func responsesToolDefsFromRaw(raw any) []toolcalling.ToolDef {
+func responsesToolDefsFromRaw(raw interface{}) []toolcalling.ToolDef {
 	return responsesToolDefsFromRawNamespace(raw, "")
 }
 
-func responsesToolDefsFromRawNamespace(raw any, inheritedNamespace string) []toolcalling.ToolDef {
-	items, ok := raw.([]any)
+func responsesToolDefsFromRawNamespace(raw interface{}, inheritedNamespace string) []toolcalling.ToolDef {
+	items, ok := raw.([]interface{})
 	if !ok {
 		return nil
 	}
 	var definitions []toolcalling.ToolDef
 	for _, item := range items {
-		tool, ok := item.(map[string]any)
+		tool, ok := item.(map[string]interface{})
 		if !ok {
 			continue
 		}
@@ -2740,8 +2737,8 @@ func responsesToolDefsFromRawNamespace(raw any, inheritedNamespace string) []too
 	return definitions
 }
 
-func mergeLoadedResponsesTools(input any, tools []toolcalling.ToolDef) []toolcalling.ToolDef {
-	items, ok := input.([]any)
+func mergeLoadedResponsesTools(input interface{}, tools []toolcalling.ToolDef) []toolcalling.ToolDef {
+	items, ok := input.([]interface{})
 	if !ok {
 		return tools
 	}
@@ -2753,7 +2750,7 @@ func mergeLoadedResponsesTools(input any, tools []toolcalling.ToolDef) []toolcal
 		}
 	}
 	for _, item := range items {
-		record, ok := item.(map[string]any)
+		record, ok := item.(map[string]interface{})
 		if !ok {
 			continue
 		}
@@ -2774,14 +2771,14 @@ func mergeLoadedResponsesTools(input any, tools []toolcalling.ToolDef) []toolcal
 	return tools
 }
 
-func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes map[string]string, status string) map[string]any {
+func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes map[string]string, status string) map[string]interface{} {
 	toolKey := responsesToolKey(call.Function.Namespace, call.Function.Name)
 	if toolTypes[toolKey] == "tool_search" {
-		var arguments any
+		var arguments interface{}
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &arguments); err != nil || arguments == nil {
-			arguments = map[string]any{"query": call.Function.Arguments}
+			arguments = map[string]interface{}{"query": call.Function.Arguments}
 		}
-		return map[string]any{
+		return map[string]interface{}{
 			"id":        callID,
 			"type":      "tool_search_call",
 			"execution": "client",
@@ -2790,7 +2787,7 @@ func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes m
 			"arguments": arguments,
 		}
 	}
-	item := map[string]any{
+	item := map[string]interface{}{
 		"id":      callID,
 		"type":    "function_call",
 		"status":  status,
@@ -2844,7 +2841,7 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 		content:      text,
 		finishReason: "stop",
 	}
-	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames, nil)
+	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames)
 	if simulated.HasPayload {
 		result.content = simulated.Content
 		if len(simulated.ToolCalls) > 0 {
@@ -2886,31 +2883,16 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 func parseResponsesSimulationWithRetry(
 	text string,
 	policy responsesToolPolicy,
-	requiredRetry func() (string, error),
-	emptyRetry func() (string, error),
+	retry func() (string, error),
 ) (responsesSimulationResult, error) {
 	result, err := parseResponsesSimulation(text, policy)
-	if err == nil {
-		if emptyRetry == nil ||
-			!responsesResultEmpty(result.content, result.toolCalls) {
-			return result, nil
-		}
-		retryText, retryErr := emptyRetry()
-		if retryErr != nil {
-			return responsesSimulationResult{}, fmt.Errorf(
-				"empty simulated response retry failed: %w",
-				retryErr,
-			)
-		}
-		return parseResponsesSimulation(retryText, policy)
-	}
-	if requiredRetry == nil ||
+	if err == nil || retry == nil ||
 		!errors.Is(err, errSimulatedToolCallRequired) {
 		return result, err
 	}
 
-	for range 2 {
-		retryText, retryErr := requiredRetry()
+	for attempt := 0; attempt < 2; attempt++ {
+		retryText, retryErr := retry()
 		if retryErr != nil {
 			return responsesSimulationResult{}, fmt.Errorf(
 				"%w: retry failed: %v",
@@ -2944,7 +2926,7 @@ func responsesSimulationRetryMessages(
 	}
 
 	retried := append([]payload.Message(nil), messages...)
-	for index := range slices.Backward(retried) {
+	for index := len(retried) - 1; index >= 0; index-- {
 		if retried[index].Role == "user" {
 			retried[index].Content += "\n\n" + retryInstruction
 			return retried
@@ -2967,205 +2949,23 @@ func responsesResultEmpty(text string, toolCalls []client.ToolCall) bool {
 	return strings.TrimSpace(text) == "" && len(toolCalls) == 0
 }
 
-var responsesPlainEmptyRetryDelays = []time.Duration{
-	10 * time.Second,
-	30 * time.Second,
-}
-
-func responsesEmptyRetrySchedule(simulateTools bool) []time.Duration {
-	if simulateTools {
-		return responsesPlainEmptyRetryDelays[:1]
-	}
-	return responsesPlainEmptyRetryDelays
-}
-
-type responsesConversationResult struct {
-	text           string
-	thinking       string
-	toolCalls      []client.ToolCall
-	finishReason   string
-	conversationID string
-}
-
-type responsesConversationCall func(
-	context.Context,
-	string,
-) (responsesConversationResult, error)
-
-func waitForResponsesEmptyRetry(
-	ctx context.Context,
-	delay time.Duration,
-) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if delay <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func responsesConversationWithEmptyRetry(
-	ctx context.Context,
-	initialConversationID string,
-	retryDelays []time.Duration,
-	onRetry func(),
-	call responsesConversationCall,
-) (responsesConversationResult, error) {
-	conversationID := initialConversationID
-	for attempt := 0; ; attempt++ {
-		result, err := call(ctx, conversationID)
-		if err != nil ||
-			!responsesResultEmpty(result.text, result.toolCalls) ||
-			attempt >= len(retryDelays) {
-			return result, err
-		}
-
-		logging.Warnf(
-			"Responses upstream completed empty; retrying attempt=%d/%d",
-			attempt+2,
-			len(retryDelays)+1,
-		)
-		if onRetry != nil {
-			onRetry()
-		}
-		if err := waitForResponsesEmptyRetry(
-			ctx,
-			retryDelays[attempt],
-		); err != nil {
-			return responsesConversationResult{}, err
-		}
-		conversationID = ""
-	}
-}
-
-type responsesStreamCall func(
-	context.Context,
-	string,
-) <-chan client.StreamChunk
-
-func responsesStreamWithEmptyRetry(
-	ctx context.Context,
-	initialConversationID string,
-	retryDelays []time.Duration,
-	simulatedTransport bool,
-	onRetry func(),
-	call responsesStreamCall,
-) <-chan client.StreamChunk {
-	output := make(chan client.StreamChunk)
-	go func() {
-		defer close(output)
-		conversationID := initialConversationID
-		emit := func(chunk client.StreamChunk) bool {
-			select {
-			case output <- chunk:
-				return true
-			case <-ctx.Done():
-				return false
-			}
-		}
-
-		for attempt := 0; ; attempt++ {
-			stream := call(ctx, conversationID)
-			sawVisibleChunk := false
-			sawFinal := false
-
-			for chunk := range stream {
-				if chunk.Error != nil {
-					emit(chunk)
-					return
-				}
-				if chunk.IsFinal {
-					sawFinal = true
-					if sawVisibleChunk || attempt >= len(retryDelays) {
-						emit(chunk)
-						return
-					}
-					break
-				}
-				if simulatedTransport {
-					// Simulated prompts can put the transport envelope in the
-					// upstream thinking channel. The Responses handler only
-					// needs raw text for its safe content extractor.
-					chunk.Thinking = ""
-				}
-				if chunk.Text == "" && chunk.Thinking == "" {
-					continue
-				}
-				sawVisibleChunk = true
-				if !emit(chunk) {
-					return
-				}
-			}
-
-			if !sawFinal {
-				if ctx.Err() == nil {
-					emit(client.StreamChunk{Error: client.ErrConnectionClosed})
-				}
-				return
-			}
-			if attempt >= len(retryDelays) {
-				return
-			}
-
-			logging.Warnf(
-				"Responses upstream stream completed empty; retrying attempt=%d/%d",
-				attempt+2,
-				len(retryDelays)+1,
-			)
-			if onRetry != nil {
-				onRetry()
-			}
-			if err := waitForResponsesEmptyRetry(
-				ctx,
-				retryDelays[attempt],
-			); err != nil {
-				return
-			}
-			conversationID = ""
-		}
-	}()
-	return output
-}
-
-func buildResponsesFailedEvent(
-	responseID, model, code, message string,
-	sequenceNumber int,
-) map[string]any {
-	return map[string]any{
-		"type":            "response.failed",
-		"sequence_number": sequenceNumber,
-		"response": map[string]any{
-			"id":     responseID,
-			"object": "response",
-			"status": "failed",
-			"model":  model,
-			"error": map[string]any{
-				"message": message,
-				"type":    "server_error",
-				"code":    code,
-			},
-		},
-	}
-}
-
 func writeResponsesServerError(w http.ResponseWriter, stream bool, responseID, model, code, message string) {
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
-		event := buildResponsesFailedEvent(
-			responseID,
-			model,
-			code,
-			message,
-			0,
-		)
+		event := map[string]interface{}{
+			"type": "response.failed",
+			"response": map[string]interface{}{
+				"id":     responseID,
+				"object": "response",
+				"status": "failed",
+				"model":  model,
+				"error": map[string]interface{}{
+					"message": message,
+					"type":    "server_error",
+					"code":    code,
+				},
+			},
+		}
 		jsonData, _ := json.Marshal(event)
 		fmt.Fprintf(w, "data: %s\n\n", jsonData)
 		fmt.Fprint(w, "data: [DONE]\n\n")
@@ -3178,8 +2978,8 @@ func writeResponsesServerError(w http.ResponseWriter, stream bool, responseID, m
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusBadGateway)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]interface{}{
 			"message": message,
 			"type":    "server_error",
 			"code":    code,
@@ -3291,26 +3091,6 @@ func truncateToTokens(text string, maxTokens int) (string, bool) {
 		return text, false
 	}
 	return strings.Join(words[:maxTokens], " "), true
-}
-
-func limitResponsesStreamDelta(
-	published string,
-	delta string,
-	maxTokens int,
-) (string, string, bool) {
-	if delta == "" {
-		return "", published, false
-	}
-	if maxTokens <= 0 ||
-		countTokens(published+delta) <= maxTokens {
-		return delta, published + delta, false
-	}
-	remaining := maxTokens - countTokens(published)
-	if remaining <= 0 {
-		return "", published, true
-	}
-	limited, _ := truncateToTokens(delta, remaining)
-	return limited, published + limited, true
 }
 
 // ===================================================================
@@ -3439,27 +3219,9 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Stream {
-		api.streamResponses(
-			r.Context(),
-			w,
-			messages,
-			cfg,
-			sid,
-			convID,
-			req.MaxOutputTokens,
-			toolPolicy,
-		)
+		api.streamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, toolPolicy)
 	} else {
-		api.nonStreamResponses(
-			r.Context(),
-			w,
-			messages,
-			cfg,
-			sid,
-			convID,
-			req.MaxOutputTokens,
-			toolPolicy,
-		)
+		api.nonStreamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, toolPolicy)
 	}
 }
 
@@ -3720,115 +3482,16 @@ func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result too
 	fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", completed)
 }
 
-func (api *APIServer) responsesConversationOnce(
-	ctx context.Context,
-	messages []payload.Message,
-	cfg models.ModelConfig,
-	conversationID string,
-	simulateTools bool,
-) (responsesConversationResult, error) {
-	text, thinking, toolCalls, finishReason, finalConversationID, err :=
-		api.m365Client.ChatConversationContext(
-			ctx,
-			messages,
-			cfg.Tone,
-			cfg.Override,
-			conversationID,
-			api.config.UserOID,
-			api.config.TenantID,
-			simulateTools,
-		)
-	return responsesConversationResult{
-		text:           text,
-		thinking:       thinking,
-		toolCalls:      toolCalls,
-		finishReason:   finishReason,
-		conversationID: finalConversationID,
-	}, err
-}
-
-func (api *APIServer) responsesRequestCanceled(
-	ctx context.Context,
-	sid string,
-) bool {
-	if ctx.Err() == nil {
-		return false
-	}
-	if sid != "" && api.ctxCache != nil {
-		api.ctxCache.Delete("session:" + sid)
-	}
-	return true
-}
-
-func (api *APIServer) responsesConversation(
-	ctx context.Context,
-	messages []payload.Message,
-	cfg models.ModelConfig,
-	conversationID string,
-	simulateTools bool,
-	onRetry func(),
-) (responsesConversationResult, error) {
-	return responsesConversationWithEmptyRetry(
-		ctx,
-		conversationID,
-		responsesEmptyRetrySchedule(simulateTools),
-		onRetry,
-		func(
-			callContext context.Context,
-			callConversationID string,
-		) (responsesConversationResult, error) {
-			result, err := api.responsesConversationOnce(
-				callContext,
-				messages,
-				cfg,
-				callConversationID,
-				simulateTools,
-			)
-			if simulateTools {
-				result.toolCalls = nil
-			}
-			return result, err
-		},
-	)
-}
-
 // nonStreamResponses handles non-streaming Responses API requests.
-func (api *APIServer) nonStreamResponses(
-	ctx context.Context,
-	w http.ResponseWriter,
-	messages []payload.Message,
-	cfg models.ModelConfig,
-	sid, convID string,
-	maxTokens int,
-	toolPolicy responsesToolPolicy,
-) {
-	result, err := api.responsesConversation(
-		ctx,
-		messages,
-		cfg,
-		convID,
-		toolPolicy.simulate,
-		func() {
-			if sid != "" {
-				api.ctxCache.Delete("session:" + sid)
-			}
-		},
-	)
+func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, toolPolicy responsesToolPolicy) {
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, toolPolicy.simulate)
 	if err != nil {
 		if sid != "" {
 			api.ctxCache.Delete("session:" + sid)
 		}
-		if api.responsesRequestCanceled(ctx, sid) {
-			return
-		}
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
 	}
-	respText := result.text
-	thinking := result.thinking
-	toolCalls := result.toolCalls
-	finishReason := result.finishReason
-	finalConvID := result.conversationID
 
 	// In simulated mode, discard backend-injected tool calls
 	if toolPolicy.simulate {
@@ -3841,73 +3504,33 @@ func (api *APIServer) nonStreamResponses(
 			respText,
 			toolPolicy,
 			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete("session:" + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					responsesSimulationRetryMessages(messages, toolPolicy),
-					cfg,
-					"",
-					true,
-				)
+				retryText, retryThinking, retryToolCalls,
+					retryFinishReason, retryConvID, retryErr :=
+					api.m365Client.ChatConversation(
+						responsesSimulationRetryMessages(messages, toolPolicy),
+						cfg.Tone,
+						cfg.Override,
+						"",
+						api.config.UserOID,
+						api.config.TenantID,
+						true,
+					)
 				if retryErr != nil {
 					return "", retryErr
 				}
-				respText = retryResult.text
-				thinking = retryResult.thinking
-				toolCalls = retryResult.toolCalls
-				finishReason = retryResult.finishReason
-				finalConvID = retryResult.conversationID
-				return retryResult.text, nil
-			},
-			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete("session:" + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					messages,
-					cfg,
-					"",
-					true,
-				)
-				if retryErr != nil {
-					return "", retryErr
-				}
-				respText = retryResult.text
-				thinking = retryResult.thinking
-				toolCalls = nil
-				finishReason = retryResult.finishReason
-				finalConvID = retryResult.conversationID
-				return retryResult.text, nil
+				respText = retryText
+				thinking = retryThinking
+				toolCalls = retryToolCalls
+				finishReason = retryFinishReason
+				finalConvID = retryConvID
+				return retryText, nil
 			},
 		)
 		if parseErr != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
-			if api.responsesRequestCanceled(ctx, sid) {
-				return
-			}
-			if errors.Is(parseErr, errSimulatedToolCallRequired) {
-				writeResponsesSimulationError(
-					w,
-					false,
-					"",
-					cfg.OpenAIID,
-					parseErr,
-				)
-			} else {
-				writeResponsesServerError(
-					w,
-					false,
-					"",
-					cfg.OpenAIID,
-					"upstream_error",
-					parseErr.Error(),
-				)
-			}
+			writeResponsesSimulationError(w, false, "", cfg.OpenAIID, parseErr)
 			return
 		}
 		respText = simulated.content
@@ -3957,15 +3580,7 @@ func (api *APIServer) nonStreamResponses(
 }
 
 // streamResponses handles streaming Responses API requests.
-func (api *APIServer) streamResponses(
-	ctx context.Context,
-	w http.ResponseWriter,
-	messages []payload.Message,
-	cfg models.ModelConfig,
-	sid, convID string,
-	maxTokens int,
-	toolPolicy responsesToolPolicy,
-) {
+func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, toolPolicy responsesToolPolicy) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "close")
@@ -3990,20 +3605,6 @@ func (api *APIServer) streamResponses(
 		fmt.Fprintf(w, "data: %s\n\n", jsonData)
 		flusher.Flush()
 	}
-	sendFailed := func(code, message string) {
-		event := buildResponsesFailedEvent(
-			responseID,
-			openaiModel,
-			code,
-			message,
-			sequenceNumber,
-		)
-		sequenceNumber++
-		jsonData, _ := json.Marshal(event)
-		fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
-	}
 
 	// Send response.created event
 	sendEvent("response.created", map[string]any{
@@ -4025,32 +3626,7 @@ func (api *APIServer) streamResponses(
 		},
 	})
 
-	ch := responsesStreamWithEmptyRetry(
-		ctx,
-		convID,
-		responsesEmptyRetrySchedule(toolPolicy.simulate),
-		toolPolicy.simulate,
-		func() {
-			if sid != "" {
-				api.ctxCache.Delete("session:" + sid)
-			}
-		},
-		func(
-			callContext context.Context,
-			callConversationID string,
-		) <-chan client.StreamChunk {
-			return api.m365Client.ChatConversationStreamGenContext(
-				callContext,
-				messages,
-				cfg.Tone,
-				cfg.Override,
-				callConversationID,
-				api.config.UserOID,
-				api.config.TenantID,
-				toolPolicy.simulate,
-			)
-		},
-	)
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, toolPolicy.simulate)
 
 	fullText := ""
 	var thinkingText strings.Builder
@@ -4066,69 +3642,32 @@ func (api *APIServer) streamResponses(
 	messageOutputIndex := 0
 	msgID := fmt.Sprintf("msg_%s", responseID)
 	reasoningID := fmt.Sprintf("rs_%s", responseID)
-	simulatedPublishedText := ""
-	emitSimulatedDelta := func(delta string) {
-		delta, published, limited := limitResponsesStreamDelta(
-			simulatedPublishedText,
-			delta,
-			maxTokens,
-		)
-		simulatedPublishedText = published
-		if limited {
-			truncated = true
-		}
-		if delta == "" {
-			return
-		}
-		if !messageItemEmitted {
-			outputIdx := 0
-			if reasoningItemEmitted {
-				outputIdx = 1
-			}
-			messageOutputIndex = outputIdx
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": outputIdx,
-				"item": map[string]any{
-					"id":      msgID,
-					"type":    "message",
-					"status":  "in_progress",
-					"role":    "assistant",
-					"phase":   "commentary",
-					"content": []any{},
-				},
-			})
-			sendEvent("response.content_part.added", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"part": map[string]any{
-					"type":        "output_text",
-					"text":        "",
-					"annotations": []any{},
-				},
-			})
-			messageItemEmitted = true
-		}
-		sendEvent("response.output_text.delta", map[string]any{
-			"item_id":       msgID,
-			"output_index":  messageOutputIndex,
-			"content_index": 0,
-			"delta":         delta,
-		})
-	}
 
 	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
-			sendFailed("upstream_error", chunk.Error.Error())
+			sendEvent("response.failed", map[string]any{
+				"response": map[string]any{
+					"id":     responseID,
+					"object": "response",
+					"status": "failed",
+					"error": map[string]any{
+						"message": chunk.Error.Error(),
+						"type":    "server_error",
+					},
+					"model": openaiModel,
+				},
+			})
 			return
 		}
 
 		if chunk.IsFinal {
 			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -4174,10 +3713,9 @@ func (api *APIServer) streamResponses(
 		// Handle text content
 		if chunk.Text != "" {
 			if toolCallingEnabled {
-				// Keep the raw transport for final tool-call parsing, while
-				// publishing only decoded assistant content.
+				// Buffer text for tool call parsing at the end
 				fullText += chunk.Text
-				emitSimulatedDelta(contentExtractor.Feed(chunk.Text))
+				contentExtractor.Feed(chunk.Text)
 			} else {
 				if !messageItemEmitted {
 					// Emit message output item
@@ -4251,17 +3789,17 @@ func (api *APIServer) streamResponses(
 			}
 		}
 	}
-	if api.responsesRequestCanceled(ctx, sid) {
-		return
-	}
+	_ = finalToolCalls
 
-	if !toolCallingEnabled && responsesResultEmpty(fullText, nil) {
+	if !toolCallingEnabled && responsesResultEmpty(fullText, finalToolCalls) {
 		if sid != "" {
 			api.ctxCache.Delete("session:" + sid)
 		}
-		sendFailed(
-			upstreamEmptyResponseCode,
-			"The upstream completed without assistant content or a tool call.",
+		writeResponsesUpstreamEmptyError(
+			w,
+			true,
+			responseID,
+			openaiModel,
 		)
 		return
 	}
@@ -4304,95 +3842,56 @@ func (api *APIServer) streamResponses(
 	finishReason := "stop"
 
 	if toolCallingEnabled {
-		initialParseText := contentExtractor.ParseText()
 		simulated, parseErr := parseResponsesSimulationWithRetry(
-			initialParseText,
+			fullText,
 			toolPolicy,
 			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete("session:" + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					responsesSimulationRetryMessages(messages, toolPolicy),
-					cfg,
-					"",
-					true,
-				)
+				retryText, _, _, _, retryConvID, retryErr :=
+					api.m365Client.ChatConversation(
+						responsesSimulationRetryMessages(messages, toolPolicy),
+						cfg.Tone,
+						cfg.Override,
+						"",
+						api.config.UserOID,
+						api.config.TenantID,
+						true,
+					)
 				if retryErr != nil {
 					return "", retryErr
 				}
-				fullText = retryResult.text
-				finalConvID = retryResult.conversationID
-				if !messageItemEmitted {
-					contentExtractor = toolcalling.ContentStreamExtractor{}
-					contentExtractor.Feed(retryResult.text)
-				}
-				return retryResult.text, nil
-			},
-			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete("session:" + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					messages,
-					cfg,
-					"",
-					true,
-				)
-				if retryErr != nil {
-					return "", retryErr
-				}
-				fullText = retryResult.text
-				finalConvID = retryResult.conversationID
-				if !messageItemEmitted {
-					contentExtractor = toolcalling.ContentStreamExtractor{}
-					contentExtractor.Feed(retryResult.text)
-				}
-				return retryResult.text, nil
+				fullText = retryText
+				finalConvID = retryConvID
+				contentExtractor = toolcalling.ContentStreamExtractor{}
+				contentExtractor.Feed(retryText)
+				return retryText, nil
 			},
 		)
 		if parseErr != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
-			if api.responsesRequestCanceled(ctx, sid) {
-				return
-			}
-			if errors.Is(parseErr, errSimulatedToolCallRequired) {
-				sendFailed(
-					simulatedToolCallRequiredCode,
-					parseErr.Error(),
-				)
-			} else {
-				sendFailed("upstream_error", parseErr.Error())
-			}
+			writeResponsesSimulationError(w, true, responseID, openaiModel, parseErr)
 			return
 		}
 		committedContent := contentExtractor.Commit(
 			toolPolicy.allowedToolNames,
 		)
-		emitSimulatedDelta(committedContent)
 		if len(simulated.toolCalls) == 0 &&
 			(committedContent != "" || simulated.content == "") {
-			simulated.content = simulatedPublishedText
-		} else if messageItemEmitted {
-			simulated.content = simulatedPublishedText
+			simulated.content = committedContent
 		}
 		fullText = simulated.content
 		toolCalls = simulated.toolCalls
 		finishReason = simulated.finishReason
-		if truncated {
-			finishReason = "length"
-		}
 		if responsesResultEmpty(fullText, toolCalls) {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
-			sendFailed(
-				upstreamEmptyResponseCode,
-				"The upstream completed without assistant content or a tool call.",
+			writeResponsesUpstreamEmptyError(
+				w,
+				true,
+				responseID,
+				openaiModel,
 			)
 			return
 		}
@@ -4411,35 +3910,35 @@ func (api *APIServer) streamResponses(
 			if len(toolCalls) > 0 {
 				phase = "commentary"
 			}
-			sendEvent("response.output_text.done", map[string]any{
+			sendEvent("response.output_text.done", map[string]interface{}{
 				"item_id":       msgID,
 				"output_index":  messageOutputIndex,
 				"content_index": 0,
 				"text":          fullText,
 			})
-			sendEvent("response.content_part.done", map[string]any{
+			sendEvent("response.content_part.done", map[string]interface{}{
 				"item_id":       msgID,
 				"output_index":  messageOutputIndex,
 				"content_index": 0,
-				"part": map[string]any{
+				"part": map[string]interface{}{
 					"type":        "output_text",
 					"text":        fullText,
-					"annotations": []any{},
+					"annotations": []interface{}{},
 				},
 			})
-			sendEvent("response.output_item.done", map[string]any{
+			sendEvent("response.output_item.done", map[string]interface{}{
 				"output_index": messageOutputIndex,
-				"item": map[string]any{
+				"item": map[string]interface{}{
 					"id":     msgID,
 					"type":   "message",
 					"status": "completed",
 					"role":   "assistant",
 					"phase":  phase,
-					"content": []map[string]any{
+					"content": []map[string]interface{}{
 						{
 							"type":        "output_text",
 							"text":        fullText,
-							"annotations": []any{},
+							"annotations": []interface{}{},
 						},
 					},
 				},
@@ -4533,24 +4032,24 @@ func (api *APIServer) streamResponses(
 				tc.Function.Name,
 			)
 			isToolSearch := toolTypes[toolKey] == "tool_search"
-			sendEvent("response.output_item.added", map[string]any{
+			sendEvent("response.output_item.added", map[string]interface{}{
 				"output_index": outputIdx,
 				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
 			})
 			if !isToolSearch {
-				sendEvent("response.function_call_arguments.delta", map[string]any{
+				sendEvent("response.function_call_arguments.delta", map[string]interface{}{
 					"item_id":      callID,
 					"output_index": outputIdx,
 					"delta":        tc.Function.Arguments,
 				})
-				sendEvent("response.function_call_arguments.done", map[string]any{
+				sendEvent("response.function_call_arguments.done", map[string]interface{}{
 					"item_id":      callID,
 					"output_index": outputIdx,
 					"name":         tc.Function.Name,
 					"arguments":    tc.Function.Arguments,
 				})
 			}
-			sendEvent("response.output_item.done", map[string]any{
+			sendEvent("response.output_item.done", map[string]interface{}{
 				"output_index": outputIdx,
 				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "completed"),
 			})
@@ -4784,7 +4283,7 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 
 	// In simulated mode, extract plain content
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			respText = sim.Content
 		}
@@ -4889,7 +4388,7 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 
 	// In simulated mode, extract plain content
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			fullText = sim.Content
 		}
@@ -5372,26 +4871,4 @@ func extFromMediaType(mediaType string) string {
 	default:
 		return "png"
 	}
-}
-
-
-// sessionIDForMessages returns an explicit session ID from the request headers.
-// It returns the X-Session-Id header value when present, and an empty string
-// otherwise. Implicit (hash-derived) session IDs are intentionally not
-// returned here; callers that want a fallback should use getSessionID instead.
-func (api *APIServer) sessionIDForMessages(r *http.Request, _ []payload.Message) string {
-	return r.Header.Get("X-Session-Id")
-}
-
-// sessionIDForRequest resolves a session ID from explicit sources only.
-// Priority: body session_id > body user field > X-Session-Id header.
-// Returns an empty string when none of the explicit sources are set.
-func (api *APIServer) sessionIDForRequest(r *http.Request, sessionID, userID string, messages []payload.Message) string {
-	if sessionID != "" {
-		return sessionID
-	}
-	if userID != "" {
-		return userID
-	}
-	return api.sessionIDForMessages(r, messages)
 }
