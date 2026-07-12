@@ -172,6 +172,42 @@ func TestParseResponsesSimulationWithRetryAcceptsRequiredToolCall(t *testing.T) 
 	}
 }
 
+func TestParseResponsesSimulationWithRetryAllowsSecondRetry(t *testing.T) {
+	policy, err := newResponsesToolPolicy(
+		responsesTestTools(),
+		map[string]interface{}{"type": "function", "name": "read_nonce"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := "```json\n" +
+		`{"choices":[{"message":{"role":"assistant","content":"No tool."},"finish_reason":"stop"}]}` +
+		"\n```"
+	retries := 0
+
+	result, err := parseResponsesSimulationWithRetry(
+		invalid,
+		policy,
+		func() (string, error) {
+			retries++
+			if retries == 1 {
+				return invalid, nil
+			}
+			return simulatedToolCallEnvelope("read_nonce"), nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("second required tool retry failed: %v", err)
+	}
+	if retries != 2 {
+		t.Fatalf("retry count = %d, want 2", retries)
+	}
+	if len(result.toolCalls) != 1 ||
+		result.toolCalls[0].Function.Name != "read_nonce" {
+		t.Fatalf("unexpected second-retry tool calls: %#v", result.toolCalls)
+	}
+}
+
 func TestParseResponsesSimulationNamedRejectsWrongDeclaredTool(t *testing.T) {
 	policy, err := newResponsesToolPolicy(
 		responsesTestTools(),
