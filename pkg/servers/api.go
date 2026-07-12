@@ -1928,15 +1928,12 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 		return
 	}
 
-	// In simulated mode, discard backend-injected tool calls (e.g.
-	// code_interpreter) — only client-declared tools parsed from the
-	// simulated JSON response are valid.
+	// In simulated mode, discard backend-injected tool calls
 	if hasTools {
 		toolCalls = nil
-		thinking = chatAnthropicThinkingForOutput(thinking, true)
 	}
 
-	// Parse simulated tool calls from response text if tool calling is enabled
+	// Parse simulated tool calls from response text
 	if hasTools {
 		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
@@ -1955,10 +1952,6 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 				finishReason = "stop"
 			}
 		} else {
-			// M365 did not return a simulated JSON payload (e.g. it ran
-			// its own server-side tools and returned plain text). Since
-			// we discarded backend-injected toolCalls above, reset the
-			// finish reason so we don't report tool_use with no blocks.
 			finishReason = "stop"
 		}
 	}
@@ -4673,7 +4666,7 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Parse model (may contain session ID suffix)
+	// Parse model (may contain session ID suffix: "gpt5.5:my-session")
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
 	cfg := models.LookupModel(modelKey)
 	if cfg.OpenAIID == "" {
@@ -5372,4 +5365,22 @@ func extFromMediaType(mediaType string) string {
 	default:
 		return "png"
 	}
+}
+// sessionIDForMessages returns an explicit session identity sourced from the
+// request header only. It never infers a session from message content so that
+// single-turn conversations do not accidentally create persistent sessions.
+func (api *APIServer) sessionIDForMessages(r *http.Request, messages []payload.Message) string {
+	return r.Header.Get("X-Session-Id")
+}
+
+// sessionIDForRequest resolves the session identity for a request using a
+// fixed priority: explicit body session > body user field > X-Session-Id header.
+func (api *APIServer) sessionIDForRequest(r *http.Request, bodySession, bodyUser string, messages []payload.Message) string {
+	if bodySession != "" {
+		return bodySession
+	}
+	if bodyUser != "" {
+		return bodyUser
+	}
+	return api.sessionIDForMessages(r, messages)
 }
