@@ -10,3 +10,4 @@ __pycache__/*
 # Docker
 docker-data/
 webui_analysis.md
+encryption.key
