@@ -14,9 +14,9 @@ import (
 	"html"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,10 +38,6 @@ const (
 // ErrM365CookiesUnavailable indicates that no cookies for the M365 web app are stored.
 var ErrM365CookiesUnavailable = errors.New("M365 web app cookies unavailable")
 
-// ErrBrowserReauthenticationRequired indicates that Microsoft's authorize
-// flow requires JavaScript and the stored browser session must be renewed.
-var ErrBrowserReauthenticationRequired = errors.New("browser reauthentication required")
-
 // SSOCookie represents a browser cookie used by M365 authentication or web APIs.
 type SSOCookie struct {
 	Name     string `json:"name"`
@@ -58,6 +54,15 @@ type SSOCookieStore struct {
 	CapturedAt time.Time   `json:"capturedAt"`
 }
 
+// m365CookieStore holds browser cookies used by M365 web APIs.
+type m365CookieStore struct {
+	Domain      string      `json:"domain"`
+	ExtractedAt time.Time   `json:"extracted_at"`
+	Cookies     []SSOCookie `json:"cookies"`
+}
+
+var renameFile = os.Rename
+
 // generatePKCE creates a PKCE code verifier and code challenge (S256).
 func generatePKCE() (verifier, challenge string, err error) {
 	verifierBytes := make([]byte, 32)
@@ -70,57 +75,6 @@ func generatePKCE() (verifier, challenge string, err error) {
 	challenge = base64.RawURLEncoding.EncodeToString(hash[:])
 
 	return verifier, challenge, nil
-}
-
-func newSSOHTTPClient(store *SSOCookieStore) (*http.Client, error) {
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SSO cookie jar: %w", err)
-	}
-
-	loginURL, err := url.Parse("https://login.microsoftonline.com")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse SSO login URL: %w", err)
-	}
-
-	httpCookies := make([]*http.Cookie, 0, len(store.Cookies))
-	for _, cookie := range store.Cookies {
-		domain := cookie.Domain
-		if domain == "" {
-			domain = loginURL.Host
-		}
-		httpCookies = append(httpCookies, &http.Cookie{
-			Name:     cookie.Name,
-			Value:    cookie.Value,
-			Path:     cookie.Path,
-			Domain:   domain,
-			Secure:   cookie.Secure,
-			HttpOnly: cookie.HttpOnly,
-		})
-	}
-	jar.SetCookies(loginURL, httpCookies)
-
-	return &http.Client{
-		Jar: jar,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Timeout: 15 * time.Second,
-	}, nil
-}
-
-func silentAuthorizeParams(clientID, redirectURI, scope, state, challenge string) url.Values {
-	return url.Values{
-		"client_id":             {clientID},
-		"response_type":         {"code"},
-		"redirect_uri":          {redirectURI},
-		"scope":                 {scope},
-		"response_mode":         {"fragment"},
-		"prompt":                {"none"},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"S256"},
-		"state":                 {state},
-	}
 }
 
 // SaveSSOCookies encrypts and stores SSO cookies to disk.
@@ -140,25 +94,28 @@ func SaveSSOCookies(cookies []SSOCookie) error {
 		return fmt.Errorf("failed to encrypt SSO cookies: %w", err)
 	}
 
-	if err := writePrivateFile(ssoCookiesFile, []byte(encrypted)); err != nil {
-		return fmt.Errorf("failed to save SSO cookies: %w", err)
+	dir := filepath.Dir(ssoCookiesFile)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("failed to create directory: %w", err)
+		}
 	}
-	return nil
+
+	return os.WriteFile(ssoCookiesFile, []byte(encrypted), 0600)
 }
 
-// SaveM365Cookies stores browser cookies used by M365 web APIs.
+// SaveM365Cookies encrypts and stores browser cookies used by M365 web APIs.
 func SaveM365Cookies(cookies []SSOCookie) error {
-	store := struct {
-		Domain      string      `json:"domain"`
-		ExtractedAt time.Time   `json:"extracted_at"`
-		Cookies     []SSOCookie `json:"cookies"`
-	}{
+	store := m365CookieStore{
 		Domain:      "m365.cloud.microsoft",
 		ExtractedAt: time.Now(),
 		Cookies:     cookies,
 	}
+	return saveM365CookieStore(store)
+}
 
-	data, err := json.MarshalIndent(store, "", "  ")
+func saveM365CookieStore(store m365CookieStore) error {
+	data, err := json.Marshal(store)
 	if err != nil {
 		return fmt.Errorf("failed to marshal M365 cookies: %w", err)
 	}
@@ -166,8 +123,44 @@ func SaveM365Cookies(cookies []SSOCookie) error {
 	if err != nil {
 		return fmt.Errorf("failed to encrypt M365 cookies: %w", err)
 	}
-	if err := writePrivateFile(m365CookiesFile, []byte(encrypted)); err != nil {
+	if err := atomicWriteFile(m365CookiesFile, []byte(encrypted), 0600); err != nil {
 		return fmt.Errorf("failed to save M365 cookies: %w", err)
+	}
+	return nil
+}
+
+func atomicWriteFile(path string, data []byte, mode os.FileMode) (returnErr error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	temporary, err := os.CreateTemp(dir, ".m365-cookies-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() {
+		if returnErr != nil {
+			temporary.Close()
+			os.Remove(temporaryPath)
+		}
+	}()
+
+	if err := temporary.Chmod(mode); err != nil {
+		return fmt.Errorf("failed to set temporary file permissions: %w", err)
+	}
+	if _, err := temporary.Write(data); err != nil {
+		return fmt.Errorf("failed to write temporary file: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		return fmt.Errorf("failed to sync temporary file: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary file: %w", err)
+	}
+	if err := renameFile(temporaryPath, path); err != nil {
+		return fmt.Errorf("failed to replace file: %w", err)
 	}
 	return nil
 }
@@ -198,29 +191,53 @@ func hasSSOCookies() bool {
 	return err == nil
 }
 
-// M365CookieHeader returns cookies scoped to the M365 web application.
-func (tm *TokenManager) M365CookieHeader() (string, error) {
+func loadM365CookieStore() (*m365CookieStore, error) {
 	data, err := os.ReadFile(m365CookiesFile)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrM365CookiesUnavailable, err)
+		return nil, fmt.Errorf("%w: %v", ErrM365CookiesUnavailable, err)
 	}
 
 	decrypted, decryptErr := crypto.Decrypt(string(data))
 	if decryptErr == nil {
-		data = []byte(decrypted)
+		var store m365CookieStore
+		if err := json.Unmarshal([]byte(decrypted), &store); err != nil {
+			return nil, fmt.Errorf("%w: failed to parse decrypted M365 cookies: %v", ErrM365CookiesUnavailable, err)
+		}
+		return &store, nil
 	}
 
-	var store struct {
+	var legacyData struct {
+		Domain  string      `json:"domain"`
 		Cookies []SSOCookie `json:"cookies"`
 	}
-	if err := json.Unmarshal(data, &store); err != nil {
-		return "", fmt.Errorf("%w: failed to parse M365 cookies: %v", ErrM365CookiesUnavailable, err)
+	if err := json.Unmarshal(data, &legacyData); err != nil {
+		return nil, fmt.Errorf("%w: failed to decrypt M365 cookies: %v", ErrM365CookiesUnavailable, decryptErr)
+	}
+	if legacyData.Domain == "" || legacyData.Cookies == nil {
+		return nil, fmt.Errorf("%w: invalid legacy M365 cookie store", ErrM365CookiesUnavailable)
+	}
+	legacyStore := m365CookieStore{
+		Domain:      legacyData.Domain,
+		ExtractedAt: time.Now(),
+		Cookies:     legacyData.Cookies,
+	}
+	if err := saveM365CookieStore(legacyStore); err != nil {
+		return nil, fmt.Errorf("%w: failed to migrate M365 cookies: %v", ErrM365CookiesUnavailable, err)
+	}
+	return &legacyStore, nil
+}
+
+// M365CookieHeader returns cookies scoped to the M365 web application.
+func (tm *TokenManager) M365CookieHeader() (string, error) {
+	store, err := loadM365CookieStore()
+	if err != nil {
+		return "", err
 	}
 
 	var cookieParts []string
 	for _, cookie := range store.Cookies {
 		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
-		if domain != "m365.cloud.microsoft" {
+		if domain != "m365.cloud.microsoft" && domain != "microsoft.com" {
 			continue
 		}
 		if cookie.Name == "" || cookie.Value == "" {
@@ -246,11 +263,7 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 		return "", fmt.Errorf("%w: no SSO cookies available: %v", ErrRefreshFailed, err)
 	}
 
-	age := time.Since(store.CapturedAt).Round(time.Minute)
-	logging.Debugf("reauthWithSSO: loaded %d SSO cookies captured at %s (age=%s)", len(store.Cookies), store.CapturedAt.Format(time.RFC3339), age)
-	if age > 30*24*time.Hour {
-		logging.Warnf("reauthWithSSO: SSO cookies are %s old; rerun setup-wizard --browser if reauthentication fails", age)
-	}
+	logging.Debugf("reauthWithSSO: loaded %d SSO cookies captured at %s", len(store.Cookies), store.CapturedAt.Format(time.RFC3339))
 
 	// Build Cookie header string from SSO cookies
 	var cookieParts []string
@@ -259,19 +272,35 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 	}
 	cookieHeader := strings.Join(cookieParts, "; ")
 
+	client := &http.Client{
+		// Don't follow redirects automatically; we need to capture the auth code
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 15 * time.Second,
+	}
+
 	// Generate PKCE
 	verifier, challenge, err := generatePKCE()
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)
 	}
 
-	client, err := newSSOHTTPClient(store)
-	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)
-	}
-
+	// Build authorize URL for silent auth using SSO cookies
+	// sso_reload=True tells the server to use SSO cookies and skip the BssoInterrupt page.
+	// prompt=none breaks SSO cookie recognition, so we omit it.
 	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tm.tenant)
-	params := silentAuthorizeParams(tm.clientID, defaultRedirectURI, tm.scope+" offline_access", "m365bridge-sso", challenge)
+	params := url.Values{
+		"client_id":             {tm.clientID},
+		"response_type":         {"code"},
+		"redirect_uri":          {defaultRedirectURI},
+		"scope":                 {tm.scope + " offline_access"},
+		"response_mode":         {"fragment"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"state":                 {"m365bridge-sso"},
+		"sso_reload":            {"True"},
+	}
 
 	authReq, err := http.NewRequest("GET", authorizeURL+"?"+params.Encode(), nil)
 	if err != nil {
@@ -299,11 +328,10 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 			if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
 				location = metaURL
 			} else {
-				summary := summarizeBrokerAuthorizeResponse(bodyStr)
-				if strings.Contains(strings.ToLower(summary), "requires javascript") {
-					return "", fmt.Errorf("%w: %s", ErrBrowserReauthenticationRequired, summary)
+				if len(bodyStr) > 2000 {
+					bodyStr = bodyStr[:2000]
 				}
-				return "", fmt.Errorf("%w: no redirect from authorize (status %d): %s", ErrRefreshFailed, currentResp.StatusCode, summary)
+				return "", fmt.Errorf("%w: no redirect from authorize (status %d): %s", ErrRefreshFailed, currentResp.StatusCode, bodyStr)
 			}
 		}
 
@@ -398,12 +426,6 @@ func extractMetaRefreshURL(html string) string {
 }
 
 func summarizeBrokerAuthorizeResponse(body string) string {
-	lowerBody := strings.ToLower(body)
-	if strings.Contains(lowerBody, "javascript is required to sign in") ||
-		strings.Contains(lowerBody, "login.microsoftonline.com/jsdisabled") {
-		return "Microsoft sign-in requires JavaScript; rerun setup-wizard --browser to renew the browser session"
-	}
-
 	const aadSTSMarker = "AADSTS"
 	if start := strings.Index(body, aadSTSMarker); start >= 0 {
 		details := body[start:]
@@ -415,6 +437,7 @@ func summarizeBrokerAuthorizeResponse(body string) string {
 		}
 	}
 
+	lowerBody := strings.ToLower(body)
 	if titleStart := strings.Index(lowerBody, "<title>"); titleStart >= 0 {
 		contentStart := titleStart + len("<title>")
 		if titleEnd := strings.Index(lowerBody[contentStart:], "</title>"); titleEnd >= 0 {
@@ -745,9 +768,19 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 		return "", fmt.Errorf("PKCE failed: %w", err)
 	}
 
-	params := silentAuthorizeParams(brokerClientID, designerBrokerRedirectURI, designerBrokerScope, "m365bridge-broker", challenge)
-	params.Set("brk_client_id", designerClientID)
-	params.Set("brk_redirect_uri", defaultRedirectURI)
+	// Broker authorize URL with PKCE and brk_ params
+	params := url.Values{
+		"client_id":             {brokerClientID},
+		"response_type":         {"code"},
+		"redirect_uri":          {designerBrokerRedirectURI},
+		"scope":                 {designerBrokerScope},
+		"response_mode":         {"fragment"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"brk_client_id":         {designerClientID},
+		"brk_redirect_uri":      {defaultRedirectURI},
+		"sso_reload":            {"True"},
+	}
 
 	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tm.tenant)
 	authReq, err := http.NewRequest("GET", authorizeURL+"?"+params.Encode(), nil)
@@ -758,9 +791,11 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 	authReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	authReq.Header.Set("Cookie", cookieHeader)
 
-	httpClient, err := newSSOHTTPClient(store)
-	if err != nil {
-		return "", err
+	httpClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 15 * time.Second,
 	}
 
 	currentResp, err := httpClient.Do(authReq)
@@ -783,11 +818,7 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 			if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
 				location = metaURL
 			} else {
-				summary := summarizeBrokerAuthorizeResponse(bodyStr)
-				if strings.Contains(strings.ToLower(summary), "requires javascript") {
-					return "", fmt.Errorf("%w: %s", ErrBrowserReauthenticationRequired, summary)
-				}
-				return "", fmt.Errorf("no redirect from broker authorize (status %d, hop %d): %s", currentResp.StatusCode, i, summary)
+				return "", fmt.Errorf("no redirect from broker authorize (status %d, hop %d): %s", currentResp.StatusCode, i, summarizeBrokerAuthorizeResponse(bodyStr))
 			}
 		}
 
@@ -935,10 +966,12 @@ func (tm *TokenManager) writeBrokerRefreshToken(token string) error {
 		return fmt.Errorf("failed to encrypt broker refresh token: %w", err)
 	}
 
-	if err := writePrivateFile(designerBrokerRefreshFile, []byte(encrypted)); err != nil {
-		return fmt.Errorf("failed to save broker refresh token: %w", err)
+	dir := filepath.Dir(designerBrokerRefreshFile)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("failed to create directory for broker refresh token: %w", err)
 	}
-	return nil
+
+	return os.WriteFile(designerBrokerRefreshFile, []byte(encrypted), 0600)
 }
 
 // generateClientRequestID generates a UUID for the client-request-id parameter.

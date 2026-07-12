@@ -77,6 +77,103 @@ func TestAcquireDesignerTokenDoesNotReacquireTransientFailure(t *testing.T) {
 	}
 }
 
+func TestSaveM365CookiesEncryptsStore(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+	cookies := []SSOCookie{{Name: "M365Session", Value: "sensitive-value", Domain: "m365.cloud.microsoft"}}
+
+	if err := SaveM365Cookies(cookies); err != nil {
+		t.Fatalf("save M365 cookies: %v", err)
+	}
+	data, err := os.ReadFile(m365CookiesFile)
+	if err != nil {
+		t.Fatalf("read encrypted M365 cookies: %v", err)
+	}
+	if strings.Contains(string(data), "M365Session") || strings.Contains(string(data), "sensitive-value") {
+		t.Fatal("encrypted M365 cookie store contains plaintext cookie data")
+	}
+	info, err := os.Stat(m365CookiesFile)
+	if err != nil {
+		t.Fatalf("stat M365 cookie store: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("M365 cookie store mode = %o, want 600", info.Mode().Perm())
+	}
+
+	tm := NewTokenManager("tenant", "client", "scope", "refresh", "cache")
+	header, err := tm.M365CookieHeader()
+	if err != nil {
+		t.Fatalf("load encrypted M365 cookies: %v", err)
+	}
+	if header != "M365Session=sensitive-value" {
+		t.Fatalf("unexpected M365 cookie header: %q", header)
+	}
+}
+
+func TestM365CookieHeaderMigratesLegacyPlaintextStore(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+	writeM365Cookies(t, []SSOCookie{{Name: "M365Session", Value: "legacy-value", Domain: "m365.cloud.microsoft"}})
+
+	tm := NewTokenManager("tenant", "client", "scope", "refresh", "cache")
+	header, err := tm.M365CookieHeader()
+	if err != nil {
+		t.Fatalf("migrate legacy M365 cookies: %v", err)
+	}
+	if header != "M365Session=legacy-value" {
+		t.Fatalf("unexpected M365 cookie header: %q", header)
+	}
+	data, err := os.ReadFile(m365CookiesFile)
+	if err != nil {
+		t.Fatalf("read migrated M365 cookies: %v", err)
+	}
+	if strings.Contains(string(data), "legacy-value") || json.Valid(data) {
+		t.Fatal("legacy M365 cookie store was not replaced with ciphertext")
+	}
+}
+
+func TestM365CookieHeaderRejectsCorruptCiphertextWithoutOverwrite(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+	original := []byte("not-valid-ciphertext")
+	if err := os.WriteFile(m365CookiesFile, original, 0600); err != nil {
+		t.Fatalf("write corrupt M365 cookies: %v", err)
+	}
+
+	tm := NewTokenManager("tenant", "client", "scope", "refresh", "cache")
+	_, err := tm.M365CookieHeader()
+	if !errors.Is(err, ErrM365CookiesUnavailable) {
+		t.Fatalf("expected M365 cookies unavailable, got %v", err)
+	}
+	current, readErr := os.ReadFile(m365CookiesFile)
+	if readErr != nil {
+		t.Fatalf("read corrupt M365 cookies: %v", readErr)
+	}
+	if string(current) != string(original) {
+		t.Fatal("corrupt ciphertext was overwritten")
+	}
+}
+
+func TestSaveM365CookiesPreservesExistingFileWhenRenameFails(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+	original := []byte("existing-data")
+	if err := os.WriteFile(m365CookiesFile, original, 0600); err != nil {
+		t.Fatalf("write existing M365 cookies: %v", err)
+	}
+	previousRename := renameFile
+	renameFile = func(string, string) error { return errors.New("rename failed") }
+	t.Cleanup(func() { renameFile = previousRename })
+
+	err := SaveM365Cookies([]SSOCookie{{Name: "M365Session", Value: "new-value", Domain: "m365.cloud.microsoft"}})
+	if err == nil {
+		t.Fatal("expected save failure")
+	}
+	current, readErr := os.ReadFile(m365CookiesFile)
+	if readErr != nil {
+		t.Fatalf("read existing M365 cookies: %v", readErr)
+	}
+	if string(current) != string(original) {
+		t.Fatal("existing M365 cookie store changed after failed rename")
+	}
+}
+
 func TestM365CookieHeaderFiltersCookiesByDomain(t *testing.T) {
 	useTemporaryWorkingDirectory(t)
 	writeM365Cookies(t, []SSOCookie{
@@ -172,8 +269,9 @@ func TestSummarizeBrokerAuthorizeResponseRecognizesJavaScriptRequirement(t *test
 func writeM365Cookies(t *testing.T, cookies []SSOCookie) {
 	t.Helper()
 	data, err := json.Marshal(map[string]any{
-		"domain":  "m365.cloud.microsoft",
-		"cookies": cookies,
+		"domain":       "m365.cloud.microsoft",
+		"extracted_at": "legacy-browser-timestamp",
+		"cookies":      cookies,
 	})
 	if err != nil {
 		t.Fatalf("marshal M365 cookies: %v", err)

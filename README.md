@@ -844,8 +844,9 @@ data/                    # Runtime data (gitignored): tokens/, setup.json, cache
 ## Security
 
 - Refresh tokens encrypted with AES-256-GCM before storage
-- SSO cookies encrypted with AES-256-GCM before storage (`data/tokens/sso_cookies.json`)
-- Encryption key stored in `data/tokens/encryption.key`
+- SSO and M365 web cookies encrypted with AES-256-GCM before storage (`data/tokens/sso_cookies.json` and `data/tokens/m365_cookies.json`)
+- Legacy plaintext M365 cookie stores are encrypted automatically on first use
+- Encryption key stored in `data/tokens/encryption.key`; losing it makes encrypted credentials unreadable and requires rerunning the setup wizard
 - Access tokens cached in `data/tokens/token_cache.json` (disk-persisted, ~1h expiry with 60s buffer)
 - Background token refresher proactively refreshes access token every 30 minutes in `serve` mode
 - SSO cookie auto-renewal silently re-authenticates when refresh token expires (24h SPA limit)

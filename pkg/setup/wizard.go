@@ -63,7 +63,7 @@ func Run(filePath string) error {
 			if err := auth.SaveM365Cookies(m365Cookies); err != nil {
 				fmt.Printf("  Warning: failed to save M365 web cookies: %v\n", err)
 			} else {
-				fmt.Println("  M365 web cookies saved")
+				fmt.Println("  M365 web cookies encrypted and saved")
 			}
 		}
 	}

@@ -836,8 +836,9 @@ data/                    # Çalışma zamanı verisi (gitignore'lı): tokens/, s
 ## Güvenlik
 
 - Refresh token'lar depolamadan önce AES-256-GCM ile şifrelenir
-- SSO cookie'ler depolamadan önce AES-256-GCM ile şifrelenir (`data/tokens/sso_cookies.json`)
-- Şifreleme anahtarı `data/tokens/encryption.key` dosyasında saklanır
+- SSO ve M365 web cookie'leri depolamadan önce AES-256-GCM ile şifrelenir (`data/tokens/sso_cookies.json` ve `data/tokens/m365_cookies.json`)
+- Eski plaintext M365 cookie depoları ilk kullanımda otomatik olarak şifrelenir
+- Şifreleme anahtarı `data/tokens/encryption.key` dosyasında saklanır; anahtar kaybolursa şifreli kimlik bilgileri okunamaz ve setup wizard yeniden çalıştırılmalıdır
 - Access token'lar `data/tokens/token_cache.json` dosyasında önbelleğe alınır (disk'te saklanır, ~1 saat geçerli, 60 saniye buffer ile)
 - Arka plan token yenileyici, `serve` modunda her 30 dakikada bir access token'ı proaktif olarak yeniler
 - SSO cookie otomatik yenileme, refresh token süresi dolduğunda (24h SPA limiti) sessizce yeniden kimlik doğrular
