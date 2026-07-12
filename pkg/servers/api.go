@@ -3,6 +3,7 @@
 package servers
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
@@ -3219,7 +3220,16 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Stream {
-		api.streamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, toolPolicy)
+		api.streamResponses(
+			r.Context(),
+			w,
+			messages,
+			cfg,
+			sid,
+			convID,
+			req.MaxOutputTokens,
+			toolPolicy,
+		)
 	} else {
 		api.nonStreamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, toolPolicy)
 	}
@@ -3580,7 +3590,15 @@ func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []paylo
 }
 
 // streamResponses handles streaming Responses API requests.
-func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, toolPolicy responsesToolPolicy) {
+func (api *APIServer) streamResponses(
+	ctx context.Context,
+	w http.ResponseWriter,
+	messages []payload.Message,
+	cfg models.ModelConfig,
+	sid, convID string,
+	maxTokens int,
+	toolPolicy responsesToolPolicy,
+) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "close")
@@ -3626,7 +3644,16 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 		},
 	})
 
-	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, toolPolicy.simulate)
+	ch := api.m365Client.ChatConversationStreamGenContext(
+		ctx,
+		messages,
+		cfg.Tone,
+		cfg.Override,
+		convID,
+		api.config.UserOID,
+		api.config.TenantID,
+		toolPolicy.simulate,
+	)
 
 	fullText := ""
 	var thinkingText strings.Builder
@@ -3788,6 +3815,9 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 				})
 			}
 		}
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	_ = finalToolCalls
 
