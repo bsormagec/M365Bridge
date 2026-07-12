@@ -2638,10 +2638,10 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice interface{})
 	}
 
 	if policy.simulate && len(policy.allowedToolNames) == 0 {
-		return responsesToolPolicy{}, errors.New("Responses tools must include at least one function name")
+		return responsesToolPolicy{}, errors.New("responses tools must include at least one function name")
 	}
 	if policy.required && !policy.simulate {
-		return responsesToolPolicy{}, errors.New("Responses tool_choice requires at least one tool")
+		return responsesToolPolicy{}, errors.New("responses tool_choice requires at least one tool")
 	}
 	return policy, nil
 }
