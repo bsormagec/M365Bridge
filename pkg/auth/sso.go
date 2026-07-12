@@ -360,7 +360,7 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 			if authCode != "" {
 				// Exchange auth code for tokens
 				logging.Info("reauthWithSSO: obtained auth code, exchanging for tokens")
-				return tm.exchangeAuthCode(authCode, verifier, cookieHeader)
+				return tm.exchangeAuthCode(authCode, verifier)
 			}
 		}
 
@@ -456,7 +456,7 @@ func summarizeBrokerAuthorizeResponse(body string) string {
 }
 
 // exchangeAuthCode exchanges an authorization code for access and refresh tokens.
-func (tm *TokenManager) exchangeAuthCode(authCode, verifier, cookieHeader string) (string, error) {
+func (tm *TokenManager) exchangeAuthCode(authCode, verifier string) (string, error) {
 	tokenData := url.Values{
 		"client_id":     {tm.clientID},
 		"grant_type":    {"authorization_code"},
@@ -809,7 +809,7 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 	// before the final redirect to spalanding#code=..., especially in headless/Docker
 	// environments where JS is not available.
 	const maxRedirects = 10
-	for i := 0; i < maxRedirects; i++ {
+	for i := range maxRedirects {
 		location := currentResp.Header.Get("Location")
 		if location == "" {
 			body, _ := io.ReadAll(currentResp.Body)
