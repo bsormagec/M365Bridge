@@ -2484,10 +2484,11 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice 
 	prompt := toolcalling.BuildSimulatedPrompt(requestJSON, true, toolChoice)
 	for i := len(*messages) - 1; i >= 0; i-- {
 		if (*messages)[i].Role == "user" {
+			suffix := ""
 			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
-				prompt += "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
+				suffix = "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
 			}
-			(*messages)[i].Content = prompt
+			(*messages)[i].Content = prompt + suffix
 			break
 		}
 	}
@@ -2517,10 +2518,11 @@ func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, to
 	prompt := toolcalling.BuildSimulatedPromptAnthropic(requestJSON, true, toolChoice)
 	for i := len(*messages) - 1; i >= 0; i-- {
 		if (*messages)[i].Role == "user" {
+			suffix := ""
 			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
-				prompt += "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
+				suffix = "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
 			}
-			(*messages)[i].Content = prompt
+			(*messages)[i].Content = prompt + suffix
 			break
 		}
 	}
@@ -2577,7 +2579,7 @@ type responsesSimulationResult struct {
 	finishReason string
 }
 
-func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice interface{}) (responsesToolPolicy, error) {
+func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice any) (responsesToolPolicy, error) {
 	allNames := responsesToolNames(tools)
 	knownNames := make(map[string]bool, len(tools))
 	for _, name := range allNames {
@@ -2614,11 +2616,11 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice interface{})
 			policy.promptChoice = choice
 			policy.allowedToolNames = []string{choice}
 		}
-	case map[string]interface{}:
+	case map[string]any:
 		name, _ := choice["name"].(string)
 		choiceType, _ := choice["type"].(string)
 		if name == "" {
-			if function, ok := choice["function"].(map[string]interface{}); ok {
+			if function, ok := choice["function"].(map[string]any); ok {
 				name, _ = function["name"].(string)
 			}
 		}
@@ -2691,18 +2693,18 @@ func responsesToolTypes(tools []toolcalling.ToolDef) map[string]string {
 	return types
 }
 
-func responsesToolDefsFromRaw(raw interface{}) []toolcalling.ToolDef {
+func responsesToolDefsFromRaw(raw any) []toolcalling.ToolDef {
 	return responsesToolDefsFromRawNamespace(raw, "")
 }
 
-func responsesToolDefsFromRawNamespace(raw interface{}, inheritedNamespace string) []toolcalling.ToolDef {
-	items, ok := raw.([]interface{})
+func responsesToolDefsFromRawNamespace(raw any, inheritedNamespace string) []toolcalling.ToolDef {
+	items, ok := raw.([]any)
 	if !ok {
 		return nil
 	}
 	var definitions []toolcalling.ToolDef
 	for _, item := range items {
-		tool, ok := item.(map[string]interface{})
+		tool, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -2738,8 +2740,8 @@ func responsesToolDefsFromRawNamespace(raw interface{}, inheritedNamespace strin
 	return definitions
 }
 
-func mergeLoadedResponsesTools(input interface{}, tools []toolcalling.ToolDef) []toolcalling.ToolDef {
-	items, ok := input.([]interface{})
+func mergeLoadedResponsesTools(input any, tools []toolcalling.ToolDef) []toolcalling.ToolDef {
+	items, ok := input.([]any)
 	if !ok {
 		return tools
 	}
@@ -2751,7 +2753,7 @@ func mergeLoadedResponsesTools(input interface{}, tools []toolcalling.ToolDef) [
 		}
 	}
 	for _, item := range items {
-		record, ok := item.(map[string]interface{})
+		record, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -2772,14 +2774,14 @@ func mergeLoadedResponsesTools(input interface{}, tools []toolcalling.ToolDef) [
 	return tools
 }
 
-func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes map[string]string, status string) map[string]interface{} {
+func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes map[string]string, status string) map[string]any {
 	toolKey := responsesToolKey(call.Function.Namespace, call.Function.Name)
 	if toolTypes[toolKey] == "tool_search" {
-		var arguments interface{}
+		var arguments any
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &arguments); err != nil || arguments == nil {
-			arguments = map[string]interface{}{"query": call.Function.Arguments}
+			arguments = map[string]any{"query": call.Function.Arguments}
 		}
-		return map[string]interface{}{
+		return map[string]any{
 			"id":        callID,
 			"type":      "tool_search_call",
 			"execution": "client",
@@ -2788,7 +2790,7 @@ func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes m
 			"arguments": arguments,
 		}
 	}
-	item := map[string]interface{}{
+	item := map[string]any{
 		"id":      callID,
 		"type":    "function_call",
 		"status":  status,
@@ -2907,7 +2909,7 @@ func parseResponsesSimulationWithRetry(
 		return result, err
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
+	for range 2 {
 		retryText, retryErr := requiredRetry()
 		if retryErr != nil {
 			return responsesSimulationResult{}, fmt.Errorf(
@@ -3136,16 +3138,16 @@ func responsesStreamWithEmptyRetry(
 func buildResponsesFailedEvent(
 	responseID, model, code, message string,
 	sequenceNumber int,
-) map[string]interface{} {
-	return map[string]interface{}{
+) map[string]any {
+	return map[string]any{
 		"type":            "response.failed",
 		"sequence_number": sequenceNumber,
-		"response": map[string]interface{}{
+		"response": map[string]any{
 			"id":     responseID,
 			"object": "response",
 			"status": "failed",
 			"model":  model,
-			"error": map[string]interface{}{
+			"error": map[string]any{
 				"message": message,
 				"type":    "server_error",
 				"code":    code,
@@ -3176,8 +3178,8 @@ func writeResponsesServerError(w http.ResponseWriter, stream bool, responseID, m
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusBadGateway)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"error": map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
 			"message": message,
 			"type":    "server_error",
 			"code":    code,
@@ -4409,35 +4411,35 @@ func (api *APIServer) streamResponses(
 			if len(toolCalls) > 0 {
 				phase = "commentary"
 			}
-			sendEvent("response.output_text.done", map[string]interface{}{
+			sendEvent("response.output_text.done", map[string]any{
 				"item_id":       msgID,
 				"output_index":  messageOutputIndex,
 				"content_index": 0,
 				"text":          fullText,
 			})
-			sendEvent("response.content_part.done", map[string]interface{}{
+			sendEvent("response.content_part.done", map[string]any{
 				"item_id":       msgID,
 				"output_index":  messageOutputIndex,
 				"content_index": 0,
-				"part": map[string]interface{}{
+				"part": map[string]any{
 					"type":        "output_text",
 					"text":        fullText,
-					"annotations": []interface{}{},
+					"annotations": []any{},
 				},
 			})
-			sendEvent("response.output_item.done", map[string]interface{}{
+			sendEvent("response.output_item.done", map[string]any{
 				"output_index": messageOutputIndex,
-				"item": map[string]interface{}{
+				"item": map[string]any{
 					"id":     msgID,
 					"type":   "message",
 					"status": "completed",
 					"role":   "assistant",
 					"phase":  phase,
-					"content": []map[string]interface{}{
+					"content": []map[string]any{
 						{
 							"type":        "output_text",
 							"text":        fullText,
-							"annotations": []interface{}{},
+							"annotations": []any{},
 						},
 					},
 				},
@@ -4531,24 +4533,24 @@ func (api *APIServer) streamResponses(
 				tc.Function.Name,
 			)
 			isToolSearch := toolTypes[toolKey] == "tool_search"
-			sendEvent("response.output_item.added", map[string]interface{}{
+			sendEvent("response.output_item.added", map[string]any{
 				"output_index": outputIdx,
 				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
 			})
 			if !isToolSearch {
-				sendEvent("response.function_call_arguments.delta", map[string]interface{}{
+				sendEvent("response.function_call_arguments.delta", map[string]any{
 					"item_id":      callID,
 					"output_index": outputIdx,
 					"delta":        tc.Function.Arguments,
 				})
-				sendEvent("response.function_call_arguments.done", map[string]interface{}{
+				sendEvent("response.function_call_arguments.done", map[string]any{
 					"item_id":      callID,
 					"output_index": outputIdx,
 					"name":         tc.Function.Name,
 					"arguments":    tc.Function.Arguments,
 				})
 			}
-			sendEvent("response.output_item.done", map[string]interface{}{
+			sendEvent("response.output_item.done", map[string]any{
 				"output_index": outputIdx,
 				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "completed"),
 			})

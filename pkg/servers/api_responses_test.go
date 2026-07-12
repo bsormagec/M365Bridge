@@ -52,7 +52,7 @@ func TestResponsesToolPolicy(t *testing.T) {
 	tools := responsesTestTools()
 	tests := []struct {
 		name         string
-		choice       interface{}
+		choice       any
 		wantSimulate bool
 		wantRequired bool
 		wantName     string
@@ -63,7 +63,7 @@ func TestResponsesToolPolicy(t *testing.T) {
 		{name: "none", choice: "none", wantSimulate: false},
 		{
 			name:         "named",
-			choice:       map[string]interface{}{"type": "function", "name": "read_nonce"},
+			choice:       map[string]any{"type": "function", "name": "read_nonce"},
 			wantSimulate: true,
 			wantRequired: true,
 			wantName:     "read_nonce",
@@ -92,7 +92,7 @@ func TestResponsesToolPolicy(t *testing.T) {
 func TestResponsesToolPolicyRejectsUnknownNamedTool(t *testing.T) {
 	_, err := newResponsesToolPolicy(
 		responsesTestTools(),
-		map[string]interface{}{"type": "function", "name": "invented_tool"},
+		map[string]any{"type": "function", "name": "invented_tool"},
 	)
 	if err == nil {
 		t.Fatal("expected unknown named tool to be rejected")
@@ -104,7 +104,7 @@ func TestResponsesToolPolicyAcceptsBuiltInToolType(t *testing.T) {
 
 	policy, err := newResponsesToolPolicy(
 		tools,
-		map[string]interface{}{"type": "tool_search"},
+		map[string]any{"type": "tool_search"},
 	)
 	if err != nil {
 		t.Fatalf("built-in Responses tool rejected: %v", err)
@@ -143,7 +143,7 @@ func TestParseResponsesSimulationRequiredRejectsPlainContent(t *testing.T) {
 func TestParseResponsesSimulationWithRetryAcceptsRequiredToolCall(t *testing.T) {
 	policy, err := newResponsesToolPolicy(
 		responsesTestTools(),
-		map[string]interface{}{"type": "function", "name": "read_nonce"},
+		map[string]any{"type": "function", "name": "read_nonce"},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +177,7 @@ func TestParseResponsesSimulationWithRetryAcceptsRequiredToolCall(t *testing.T) 
 func TestParseResponsesSimulationWithRetryAllowsSecondRetry(t *testing.T) {
 	policy, err := newResponsesToolPolicy(
 		responsesTestTools(),
-		map[string]interface{}{"type": "function", "name": "read_nonce"},
+		map[string]any{"type": "function", "name": "read_nonce"},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -248,7 +248,7 @@ func TestParseResponsesSimulationWithRetryRetriesEmptyAutoResult(t *testing.T) {
 func TestParseResponsesSimulationNamedRejectsWrongDeclaredTool(t *testing.T) {
 	policy, err := newResponsesToolPolicy(
 		responsesTestTools(),
-		map[string]interface{}{"type": "function", "name": "read_nonce"},
+		map[string]any{"type": "function", "name": "read_nonce"},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -360,7 +360,7 @@ func TestBuildResponsesObjectPlacesCommentaryBeforeToolCall(t *testing.T) {
 		1,
 		0,
 	)
-	output, ok := response["output"].([]map[string]interface{})
+	output, ok := response["output"].([]map[string]any)
 	if !ok {
 		t.Fatalf("response output has unexpected type: %T", response["output"])
 	}
@@ -401,7 +401,7 @@ func TestBuildResponsesToolCallItemUsesDeclaredBuiltInType(t *testing.T) {
 	if item["execution"] != "client" {
 		t.Fatalf("tool_search execution = %#v", item["execution"])
 	}
-	if _, ok := item["arguments"].(map[string]interface{}); !ok {
+	if _, ok := item["arguments"].(map[string]any); !ok {
 		t.Fatalf("tool_search arguments are not a JSON object: %#v", item["arguments"])
 	}
 }
@@ -455,14 +455,14 @@ func TestBuildResponsesToolCallItemIncludesEmptyArgumentsWhileInProgress(t *test
 }
 
 func TestMergeLoadedResponsesTools(t *testing.T) {
-	input := []interface{}{
-		map[string]interface{}{
+	input := []any{
+		map[string]any{
 			"type": "tool_search_output",
-			"tools": []interface{}{
-				map[string]interface{}{
+			"tools": []any{
+				map[string]any{
 					"type": "namespace",
-					"tools": []interface{}{
-						map[string]interface{}{
+					"tools": []any{
+						map[string]any{
 							"type": "function",
 							"name": "node_repl",
 						},
@@ -483,22 +483,22 @@ func TestMergeLoadedResponsesTools(t *testing.T) {
 }
 
 func TestMergeLoadedResponsesToolsPreservesDuplicateNamespacedTools(t *testing.T) {
-	input := []interface{}{
-		map[string]interface{}{
+	input := []any{
+		map[string]any{
 			"type": "tool_search_output",
-			"tools": []interface{}{
-				map[string]interface{}{
+			"tools": []any{
+				map[string]any{
 					"type": "namespace",
 					"name": "mcp__node_repl",
-					"tools": []interface{}{
-						map[string]interface{}{"type": "function", "name": "js"},
+					"tools": []any{
+						map[string]any{"type": "function", "name": "js"},
 					},
 				},
-				map[string]interface{}{
+				map[string]any{
 					"type": "namespace",
 					"name": "mcp__browser",
-					"tools": []interface{}{
-						map[string]interface{}{"type": "function", "name": "js"},
+					"tools": []any{
+						map[string]any{"type": "function", "name": "js"},
 					},
 				},
 			},
@@ -553,21 +553,21 @@ func TestParseResponsesSimulationRejectsAmbiguousUnqualifiedNamespace(t *testing
 }
 
 func TestResponsesInputPreservesToolSearchAndCompactionHistory(t *testing.T) {
-	input := []interface{}{
-		map[string]interface{}{
+	input := []any{
+		map[string]any{
 			"type":      "tool_search_call",
-			"arguments": map[string]interface{}{"query": "node repl"},
+			"arguments": map[string]any{"query": "node repl"},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "tool_search_output",
-			"tools": []interface{}{
-				map[string]interface{}{
+			"tools": []any{
+				map[string]any{
 					"type": "function",
 					"name": "node_repl",
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type":              "compaction",
 			"encrypted_content": "Earlier work summary",
 		},
@@ -589,9 +589,9 @@ func TestResponsesInputPreservesToolSearchAndCompactionHistory(t *testing.T) {
 	}
 }
 
-func TestResponsesFunctionCallOutputBecomesAuthoritativeUserHistory(t *testing.T) {
-	messages := responsesInputToMessages([]interface{}{
-		map[string]interface{}{
+func TestResponsesFunctionCallOutputBecomesAuthoritativeToolHistory(t *testing.T) {
+	messages := responsesInputToMessages([]any{
+		map[string]any{
 			"type":    "function_call_output",
 			"call_id": "call_nonce",
 			"output":  "NONCE-EXACT",
@@ -601,8 +601,11 @@ func TestResponsesFunctionCallOutputBecomesAuthoritativeUserHistory(t *testing.T
 	if len(messages) != 1 {
 		t.Fatalf("message count = %d", len(messages))
 	}
-	if messages[0].Role != "user" {
-		t.Fatalf("function result role = %q, want user", messages[0].Role)
+	if messages[0].Role != "tool" {
+		t.Fatalf("function result role = %q, want tool", messages[0].Role)
+	}
+	if messages[0].ToolCallID != "call_nonce" {
+		t.Fatalf("function result call id = %q, want call_nonce", messages[0].ToolCallID)
 	}
 	for _, expected := range []string{
 		"authoritative tool result",
@@ -616,37 +619,37 @@ func TestResponsesFunctionCallOutputBecomesAuthoritativeUserHistory(t *testing.T
 }
 
 func TestResponsesInputPreservesNamespacedToolState(t *testing.T) {
-	namespacedTools := []interface{}{
-		map[string]interface{}{
+	namespacedTools := []any{
+		map[string]any{
 			"type": "namespace",
 			"name": "mcp__node_repl",
-			"tools": []interface{}{
-				map[string]interface{}{
+			"tools": []any{
+				map[string]any{
 					"type": "function",
 					"name": "js",
-					"parameters": map[string]interface{}{
+					"parameters": map[string]any{
 						"type": "object",
 					},
 				},
 			},
 		},
 	}
-	input := []interface{}{
-		map[string]interface{}{
+	input := []any{
+		map[string]any{
 			"type":  "tool_search_output",
 			"tools": namespacedTools,
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type":  "additional_tools",
 			"tools": namespacedTools,
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type":      "function_call",
 			"namespace": "mcp__node_repl",
 			"name":      "js",
 			"arguments": `{"code":"1+1"}`,
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type":    "function_call_output",
 			"call_id": "call_js",
 			"output":  "2",
@@ -794,11 +797,11 @@ func TestWriteResponsesSimulationErrorNonStreaming(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
 	}
-	var body map[string]interface{}
+	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("invalid JSON body: %v", err)
 	}
-	errorObject, _ := body["error"].(map[string]interface{})
+	errorObject, _ := body["error"].(map[string]any)
 	if errorObject["code"] != simulatedToolCallRequiredCode {
 		t.Fatalf("error code = %#v, want %q", errorObject["code"], simulatedToolCallRequiredCode)
 	}
@@ -832,11 +835,11 @@ func TestBuildResponsesFailedEventIncludesSequenceNumber(t *testing.T) {
 	if got := event["sequence_number"]; got != 7 {
 		t.Fatalf("sequence_number = %#v, want 7", got)
 	}
-	response, ok := event["response"].(map[string]interface{})
+	response, ok := event["response"].(map[string]any)
 	if !ok {
 		t.Fatalf("response payload has wrong type: %#v", event["response"])
 	}
-	errorPayload, ok := response["error"].(map[string]interface{})
+	errorPayload, ok := response["error"].(map[string]any)
 	if !ok || errorPayload["code"] != "upstream_timeout" {
 		t.Fatalf("error payload mismatch: %#v", response["error"])
 	}
@@ -1303,11 +1306,11 @@ func TestWriteResponsesUpstreamEmptyErrorNonStreaming(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
 	}
-	var body map[string]interface{}
+	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("invalid JSON body: %v", err)
 	}
-	errorObject, _ := body["error"].(map[string]interface{})
+	errorObject, _ := body["error"].(map[string]any)
 	if errorObject["code"] != upstreamEmptyResponseCode {
 		t.Fatalf("error code = %#v, want %q", errorObject["code"], upstreamEmptyResponseCode)
 	}

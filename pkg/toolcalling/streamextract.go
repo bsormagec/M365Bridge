@@ -272,10 +272,7 @@ func scanStreamJSONString(raw string, start int) (string, bool) {
 }
 
 func decodeStreamJSONPrefix(raw string, complete bool) string {
-	minimum := len(raw) - 16
-	if minimum < 0 {
-		minimum = 0
-	}
+	minimum := max(len(raw)-16, 0)
 	for end := len(raw); end >= minimum; end-- {
 		prefix := raw[:end]
 		if !complete && endsWithStreamHighSurrogate(prefix) {
