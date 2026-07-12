@@ -453,8 +453,9 @@ func (api *APIServer) handleCORS(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// getSessionID extracts session ID from headers or request body.
-// Priority: X-Session-Id header > session_id body field > user body field > hash(api_key + first_user_message)
+// getSessionID extracts an explicit session ID from headers or request body.
+// Requests without an explicit identity remain stateless to prevent unrelated
+// clients from sharing M365 conversation context.
 func (api *APIServer) getSessionID(r *http.Request, reqBody map[string]any) string {
 	sid := r.Header.Get("X-Session-Id")
 	if sid == "" {
@@ -467,91 +468,17 @@ func (api *APIServer) getSessionID(r *http.Request, reqBody map[string]any) stri
 			sid = v
 		}
 	}
-	if sid == "" {
-		sid = api.hashSessionID(r, reqBody)
-	}
 	return sid
-}
-
-// hashSessionID derives a session ID from the API key and the first user message.
-// When auth is enabled, the hash includes the API key so that different keys
-// produce different sessions even with the same first message.
-// When auth is disabled, only the first user message is hashed.
-func (api *APIServer) hashSessionID(r *http.Request, reqBody map[string]any) string {
-	firstMsg := extractFirstUserMessage(reqBody)
-	if firstMsg == "" {
-		return ""
-	}
-	apiKey := api.extractAPIKey(r)
-	h := md5.Sum([]byte(apiKey + "\x00" + firstMsg))
-	return "h:" + hex.EncodeToString(h[:])
-}
-
-// extractFirstUserMessage scans the messages array and returns the first user message content.
-func extractFirstUserMessage(reqBody map[string]any) string {
-	msgs, ok := reqBody["messages"].([]any)
-	if !ok || len(msgs) == 0 {
-		return ""
-	}
-	for _, m := range msgs {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		role, _ := msg["role"].(string)
-		if role != "user" {
-			continue
-		}
-		// Content can be a string or an array of content blocks
-		switch c := msg["content"].(type) {
-		case string:
-			if c != "" {
-				return c
-			}
-		case []any:
-			for _, block := range c {
-				bm, ok := block.(map[string]any)
-				if !ok {
-					continue
-				}
-				if t, _ := bm["type"].(string); t == "text" {
-					if txt, _ := bm["text"].(string); txt != "" {
-						return txt
-					}
-				}
-			}
-		}
-	}
-	return ""
-}
-
-// hashSessionIDFromMessages derives a session ID from the API key and the first user message
-// in a typed Message slice. Used by handleChatCompletions which decodes into a struct.
-func (api *APIServer) hashSessionIDFromMessages(r *http.Request, messages []payload.Message) string {
-	firstMsg := ""
-	for _, m := range messages {
-		if m.Role == "user" && m.Content != "" {
-			firstMsg = m.Content
-			break
-		}
-	}
-	if firstMsg == "" {
-		return ""
-	}
-	apiKey := api.extractAPIKey(r)
-	h := md5.Sum([]byte(apiKey + "\x00" + firstMsg))
-	return "h:" + hex.EncodeToString(h[:])
 }
 
 // sessionIDForMessages resolves the fallback session identity for endpoints
 // whose request body has already been decoded into typed messages. Keeping the
-// fallback based on the first user message makes requests from clients that do
-// not send X-Session-Id continue the same M365 conversation.
+// requests without X-Session-Id remain stateless.
 func (api *APIServer) sessionIDForMessages(r *http.Request, messages []payload.Message) string {
 	if sid := r.Header.Get("X-Session-Id"); sid != "" {
 		return sid
 	}
-	return api.hashSessionIDFromMessages(r, messages)
+	return ""
 }
 
 func (api *APIServer) sessionIDForRequest(r *http.Request, explicitID, user string, messages []payload.Message) string {
@@ -762,7 +689,7 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Resolve session ID and conversation ID
-	// Priority: model-name session ID > request body session_id > request body user > X-Session-Id header > hash(api_key + first_user_message)
+	// Priority: model-name session ID > request body session_id > request body user > X-Session-Id header.
 	sid := modelSessionID
 	if sid == "" {
 		sid = req.SessionID
@@ -772,9 +699,6 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 	if sid == "" {
 		sid = r.Header.Get("X-Session-Id")
-	}
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, req.Messages)
 	}
 
 	var convID string
@@ -2619,7 +2543,7 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve session ID
-	// Priority: model-name session > previous_response_id > body session_id > body user > header > hash
+	// Priority: model-name session > previous_response_id > body session_id > body user > header.
 	sid := modelSessionID
 	if sid == "" {
 		sid = req.PreviousResponseID
@@ -2632,9 +2556,6 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	if sid == "" {
 		sid = r.Header.Get("X-Session-Id")
-	}
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, messages)
 	}
 
 	var convID string
@@ -3445,9 +3366,6 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 	}
 	if sid == "" {
 		sid = r.Header.Get("X-Session-Id")
-	}
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, messages)
 	}
 
 	var convID string

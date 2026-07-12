@@ -399,9 +399,11 @@ Her oturum benzersiz bir M365 sohbetine eşlenir. Oturum ID'si öncelik sırası
 1. İstek gövdesinde `session_id` alanı
 2. İstek gövdesinde `user` alanı
 3. `X-Session-Id` başlığı
-4. `hash(api_key + ilk_kullanıcı_mesajı)` (kimlik doğrulama açıkken) veya `hash(ilk_kullanıcı_mesajı)` (kimlik doğrulama kapalıyken)
 
-Hash yedeği, özel başlık gönderemeyen standart OpenAI istemcilerinin (Claude Code gibi) ilk kullanıcı mesajları farklı olduğu sürece otomatik olarak ayrı sohbetlere sahip olmasını sağlar.
+Açık bir oturum kimliği olmayan istekler stateless çalışır. Konuşma devamlılığı
+gereken istemciler yukarıdaki kimliklerden birini (veya `model:session-id`
+suffix'ini) göndermelidir. Böylece aynı API anahtarını veya ilk mesajı kullanan
+bağımsız istemcilerin M365 konuşma bağlamını paylaşması önlenir.
 
 ### Python İstemcisi (OpenAI SDK)
 

@@ -57,6 +57,27 @@ func TestSessionStoreSavesListsLoadsAndDeletes(t *testing.T) {
 	}
 }
 
+func TestSessionStoreRejectsUnsafeIDs(t *testing.T) {
+	store := newSessionStore(t.TempDir())
+	for _, id := range []string{"../escape", "/absolute", "nested/path", "", "."} {
+		if err := store.Save(persistedSession{ID: id}); err == nil {
+			t.Fatalf("Save(%q) accepted unsafe ID", id)
+		}
+		if _, err := store.Load(id); err == nil {
+			t.Fatalf("Load(%q) accepted unsafe ID", id)
+		}
+		if err := store.Delete(id); err == nil {
+			t.Fatalf("Delete(%q) accepted unsafe ID", id)
+		}
+	}
+	if err := validateSessionID("safe_session-123"); err != nil {
+		t.Fatalf("safe ID rejected: %v", err)
+	}
+	if err := validateSessionID("../escape"); err == nil {
+		t.Fatal("expected unsafe ID error")
+	}
+}
+
 func TestSessionStoreIgnoresMalformedJSON(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "broken.json"), []byte("{"), 0600); err != nil {

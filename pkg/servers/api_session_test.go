@@ -7,7 +7,7 @@ import (
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 )
 
-func TestSessionIDForMessagesPersistsAcrossTurns(t *testing.T) {
+func TestSessionIDForMessagesRequiresExplicitIdentity(t *testing.T) {
 	api := &APIServer{}
 	req := httptest.NewRequest("POST", "/v1/messages", nil)
 	messages := []payload.Message{
@@ -16,13 +16,11 @@ func TestSessionIDForMessagesPersistsAcrossTurns(t *testing.T) {
 		{Role: "user", Content: "Sen kimsin?"},
 	}
 
-	firstTurnID := api.sessionIDForMessages(req, messages[:1])
-	secondTurnID := api.sessionIDForMessages(req, messages)
-	if firstTurnID == "" {
-		t.Fatal("expected a fallback session ID")
+	if got := api.sessionIDForMessages(req, messages[:1]); got != "" {
+		t.Fatalf("implicit first-turn session ID = %q, want empty", got)
 	}
-	if secondTurnID != firstTurnID {
-		t.Fatalf("session ID changed between turns: first=%q second=%q", firstTurnID, secondTurnID)
+	if got := api.sessionIDForMessages(req, messages); got != "" {
+		t.Fatalf("implicit second-turn session ID = %q, want empty", got)
 	}
 }
 

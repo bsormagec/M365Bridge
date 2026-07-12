@@ -48,6 +48,22 @@ type sessionStore struct {
 	dir string
 }
 
+func validateSessionID(id string) error {
+	if id == "" {
+		return errors.New("session ID is required")
+	}
+	for _, character := range id {
+		if character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' ||
+			character == '-' || character == '_' {
+			continue
+		}
+		return errors.New("session ID contains unsafe characters")
+	}
+	return nil
+}
+
 func newSessionStore(dir string) sessionStore {
 	return sessionStore{dir: dir}
 }
@@ -64,8 +80,8 @@ func defaultSessionStore() sessionStore {
 }
 
 func (s sessionStore) Save(session persistedSession) error {
-	if strings.TrimSpace(session.ID) == "" {
-		return errors.New("session ID is required")
+	if err := validateSessionID(session.ID); err != nil {
+		return err
 	}
 	if session.UpdatedAt.IsZero() {
 		session.UpdatedAt = time.Now().UTC()
@@ -103,6 +119,9 @@ func (s sessionStore) Save(session persistedSession) error {
 }
 
 func (s sessionStore) Load(id string) (persistedSession, error) {
+	if err := validateSessionID(id); err != nil {
+		return persistedSession{}, err
+	}
 	data, err := os.ReadFile(filepath.Join(s.dir, id+".json"))
 	if err != nil {
 		return persistedSession{}, fmt.Errorf("read session: %w", err)
@@ -141,6 +160,9 @@ func (s sessionStore) List() ([]persistedSession, error) {
 }
 
 func (s sessionStore) Delete(id string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	err := os.Remove(filepath.Join(s.dir, id+".json"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

@@ -32,6 +32,9 @@ const (
 	tokenURLTemplate = "https://login.microsoftonline.com/%s/oauth2/v2.0/token"
 	// cacheExpiryBuffer is the time buffer before token expiry to trigger refresh.
 	cacheExpiryBuffer = 60 * time.Second
+	// tokenRequestTimeout bounds OAuth calls so refresh single-flight waiters
+	// cannot block forever behind a stalled identity provider request.
+	tokenRequestTimeout = 15 * time.Second
 )
 
 // TokenCache represents the cached access token data.
@@ -144,7 +147,7 @@ func (tm *TokenManager) refresh() (string, error) {
 	req.Header.Set("Origin", "https://m365.cloud.microsoft")
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: tokenRequestTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)
@@ -234,7 +237,7 @@ func (tm *TokenManager) GetTokenForScopeAndClient(scope, clientID string) (strin
 	req.Header.Set("Origin", "https://m365.cloud.microsoft")
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: tokenRequestTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)

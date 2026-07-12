@@ -407,9 +407,11 @@ Each session maps to a unique M365 conversation. Session ID is resolved in prior
 1. `session_id` field in request body
 2. `user` field in request body
 3. `X-Session-Id` header
-4. `hash(api_key + first_user_message)` (when auth is on) or `hash(first_user_message)` (when auth is off)
 
-The hash fallback allows standard OpenAI clients (like Claude Code) that cannot send custom headers to have separate conversations automatically, as long as their first user message differs.
+Requests without an explicit session identity are stateless. Clients that need
+conversation continuity must send one of the identifiers above (or use the
+`model:session-id` suffix). This prevents unrelated clients with the same API
+key or first prompt from sharing M365 conversation context.
 
 ### Python Client (OpenAI SDK)
 

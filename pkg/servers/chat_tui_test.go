@@ -1,6 +1,7 @@
 package servers
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -159,6 +160,49 @@ func TestBusyStateAllowsOnlyEscToStopResponse(t *testing.T) {
 	}
 	if m.textarea.Value() != "draft must remain untouched" {
 		t.Fatalf("Esc changed the draft: %q", m.textarea.Value())
+	}
+}
+
+func TestCancelRequestDrainsStaleStream(t *testing.T) {
+	stream := make(chan client.StreamChunk)
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		stream <- client.StreamChunk{Text: "stale"}
+		stream <- client.StreamChunk{IsFinal: true}
+		close(stream)
+	}()
+
+	m := newChatTUI(nil, "auto", false)
+	m.stream = stream
+	m.busy = true
+	m.cancelRequest()
+
+	select {
+	case <-producerDone:
+	case <-time.After(time.Second):
+		t.Fatal("cancelRequest did not drain the stale stream")
+	}
+}
+
+func TestNonStreamErrorRestoresComposerFocus(t *testing.T) {
+	m := newChatTUI(nil, "auto", true)
+	m.requestID = 3
+	m.busy = true
+	m.textarea.Blur()
+	m.textarea.Placeholder = "Copilot is responding..."
+
+	model, cmd := m.Update(responseMsg{requestID: 3, err: errors.New("request failed")})
+	if cmd == nil {
+		t.Fatal("response error did not return a focus command")
+	}
+	updated := model.(*chatTUI)
+	cmd()
+	if !updated.textarea.Focused() {
+		t.Fatal("response error did not restore composer focus")
+	}
+	if updated.textarea.Placeholder != "Ask anything..." {
+		t.Fatalf("placeholder = %q, want restored composer placeholder", updated.textarea.Placeholder)
 	}
 }
 

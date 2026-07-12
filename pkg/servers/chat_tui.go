@@ -282,7 +282,7 @@ func (m *chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.errText = msg.err.Error()
 			m.status = "Request failed"
-			return m, nil
+			return m, m.restoreComposerFocus()
 		}
 		m.messages[len(m.messages)-1].content = msg.text
 		m.conversation = msg.conversation
@@ -452,7 +452,15 @@ func (m *chatTUI) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 func (m *chatTUI) cancelRequest() {
 	// Invalidate any in-flight stream messages. The underlying network read may
-	// finish later, but stale chunks will be ignored by Update.
+	// finish later; drain it so the producer can close its WebSocket instead of
+	// blocking forever on the next unbuffered channel send.
+	staleStream := m.stream
+	if staleStream != nil {
+		go func() {
+			for range staleStream {
+			}
+		}()
+	}
 	m.requestID++
 	m.busy = false
 	m.stream = nil
