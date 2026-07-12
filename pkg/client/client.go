@@ -442,9 +442,9 @@ func (c *M365Client) ChatConversationStreamGenContext(
 			}
 
 			text := string(message)
-			parts := strings.Split(text, signalRDelimiter)
+			parts := strings.SplitSeq(text, signalRDelimiter)
 
-			for _, part := range parts {
+			for part := range parts {
 				part = strings.TrimSpace(part)
 				if part == "" {
 					continue
@@ -614,9 +614,9 @@ func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, err
 		}
 
 		text := string(message)
-		parts := strings.Split(text, signalRDelimiter)
+		parts := strings.SplitSeq(text, signalRDelimiter)
 
-		for _, part := range parts {
+		for part := range parts {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue

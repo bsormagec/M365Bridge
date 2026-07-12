@@ -632,11 +632,10 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 		}
 		var simulated toolcalling.SimulatedResult
 		if provider == toolLoopAnthropic {
-			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools))
 		} else {
-			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools))
 		}
-		simulated = api.repairSimulatedToolCalls(provider, messages, cfg, tools, simulated)
 		if !simulated.HasPayload || len(simulated.ToolCalls) == 0 {
 			if simulated.HasPayload {
 				text, finishReason = simulated.Content, "stop"
@@ -688,46 +687,6 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 			injectSimulatedPrompt(&messages, string(requestJSON), "auto")
 		}
 	}
-}
-
-// repairSimulatedToolCalls performs a single corrective re-ask when the initial
-// simulated parse dropped every tool call for missing required arguments. The
-// request envelope already lives in the last message, so the retry re-sends it
-// with an appended corrective note on a fresh conversation and re-parses. It
-// returns the recovered result when the backend supplies valid tool calls, and
-// the original result otherwise so callers keep their existing fallback path.
-func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, sim toolcalling.SimulatedResult) toolcalling.SimulatedResult {
-	if len(sim.ToolCalls) > 0 || len(sim.DroppedMissingArgs) == 0 || len(messages) == 0 {
-		return sim
-	}
-
-	requiredByTool := toolcalling.RequiredArgsByTool(tools)
-	note := toolcalling.BuildRepairNote(sim.DroppedMissingArgs, requiredByTool)
-	retry := make([]payload.Message, len(messages))
-	copy(retry, messages)
-	last := retry[len(retry)-1]
-	last.Content = last.Content + "\n\n" + note
-	retry[len(retry)-1] = last
-
-	logging.Warnf("repairSimulatedToolCalls: re-asking backend for tools missing required args: %v", sim.DroppedMissingArgs)
-	text, _, _, _, _, err := api.m365Client.ChatConversation(retry, cfg.Tone, cfg.Override, "", api.config.UserOID, api.config.TenantID, true)
-	if err != nil {
-		logging.Errorf("repairSimulatedToolCalls: retry failed: %v", err)
-		return sim
-	}
-
-	var retried toolcalling.SimulatedResult
-	if provider == toolLoopAnthropic {
-		retried = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), requiredByTool)
-	} else {
-		retried = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), requiredByTool)
-	}
-	if len(retried.ToolCalls) > 0 {
-		logging.Infof("repairSimulatedToolCalls: recovered %d tool call(s) after re-ask", len(retried.ToolCalls))
-		return retried
-	}
-	logging.Warn("repairSimulatedToolCalls: re-ask did not yield valid tool calls; keeping original response")
-	return sim
 }
 
 // handleChatCompletions handles OpenAI chat completion requests.
@@ -1289,7 +1248,6 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	hasContent := false
 	fullText := ""
 	var thinkingText strings.Builder
-	var thinkingFilter toolcalling.ThinkingStreamFilter
 	truncated := false
 
 	// When tool calling is enabled AND tools are present, buffer all text and
@@ -1319,17 +1277,6 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 		if chunk.Thinking != "" {
 			thinkingText.WriteString(chunk.Thinking)
 			if toolCallingEnabled {
-				// Live-stream filtered thinking so the transport envelope never
-				// leaks, matching the Anthropic streaming path.
-				if emit := thinkingFilter.Feed(chunk.Thinking); emit != "" {
-					payload := map[string]any{"reasoning_content": emit}
-					if !hasContent {
-						payload["role"] = "assistant"
-						hasContent = true
-					}
-					api.sendSSEChunk(w, chunkID, openaiModel, payload)
-					flusher.Flush()
-				}
 				continue
 			}
 			if !hasContent {
@@ -1378,8 +1325,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, sim)
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -1391,13 +1337,19 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	}
 
 	if toolCallingEnabled {
-		if rem := thinkingFilter.Flush(); rem != "" {
-			payload := map[string]any{"reasoning_content": rem}
+		thinkingOutput := chatAnthropicThinkingForOutput(thinkingText.String(), true)
+		if thinkingOutput != "" {
 			if !hasContent {
-				payload["role"] = "assistant"
+				api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
+					"role":              "assistant",
+					"reasoning_content": thinkingOutput,
+				})
 				hasContent = true
+			} else {
+				api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
+					"reasoning_content": thinkingOutput,
+				})
 			}
-			api.sendSSEChunk(w, chunkID, openaiModel, payload)
 			flusher.Flush()
 		}
 	}
@@ -1554,8 +1506,7 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, sim)
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -1688,8 +1639,6 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	// Stream content with optional thinking block
 	fullText := ""
 	var thinkingText strings.Builder
-	var thinkingFilter toolcalling.ThinkingStreamFilter
-	thinkingClosed := false
 	truncated := false
 	thinkingBlockOpen := false
 	textBlockOpen := false
@@ -1726,17 +1675,6 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 		if chunk.Thinking != "" {
 			thinkingText.WriteString(chunk.Thinking)
 			if toolCallingEnabled {
-				// Live-stream thinking through a stateful filter that strips the
-				// simulated transport envelope (fenced blocks + meta-prose) so
-				// the model's reasoning is visible without exposing the mechanism.
-				if emit := thinkingFilter.Feed(chunk.Thinking); emit != "" {
-					if !thinkingBlockOpen {
-						api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
-						thinkingBlockOpen = true
-					}
-					api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": emit}})
-					flusher.Flush()
-				}
 				continue
 			}
 			if !thinkingBlockOpen {
@@ -1758,18 +1696,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 			continue
 		}
 
-		// Transition from thinking to text: flush the filter remainder (tool
-		// path) then close any open thinking block before content follows.
-		if toolCallingEnabled && !thinkingClosed {
-			if rem := thinkingFilter.Flush(); rem != "" {
-				if !thinkingBlockOpen {
-					api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
-					thinkingBlockOpen = true
-				}
-				api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": rem}})
-			}
-			thinkingClosed = true
-		}
+		// Transition from thinking to text
 		if thinkingBlockOpen && !textBlockOpen {
 			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
 			blockIndex++
@@ -1812,8 +1739,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
-		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, sim)
+		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -1824,22 +1750,26 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 		}
 	}
 
-	// Flush any remaining filtered thinking when the response was thinking-only
-	// (no content chunk triggered the in-loop transition) and close its block.
-	if toolCallingEnabled && !thinkingClosed {
-		if rem := thinkingFilter.Flush(); rem != "" {
-			if !thinkingBlockOpen {
-				api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
-				thinkingBlockOpen = true
-			}
-			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": rem}})
-		}
-		if thinkingBlockOpen {
-			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
+	if toolCallingEnabled {
+		thinkingOutput := chatAnthropicThinkingForOutput(thinkingText.String(), true)
+		if thinkingOutput != "" {
+			api.sendAnthropicSSE(w, "content_block_start", map[string]any{
+				"type":          "content_block_start",
+				"index":         blockIndex,
+				"content_block": map[string]any{"type": "thinking", "thinking": ""},
+			})
+			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": blockIndex,
+				"delta": map[string]any{"type": "thinking_delta", "thinking": thinkingOutput},
+			})
+			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{
+				"type":  "content_block_stop",
+				"index": blockIndex,
+			})
 			blockIndex++
-			thinkingBlockOpen = false
+			flusher.Flush()
 		}
-		thinkingClosed = true
 	}
 
 	// If tool calling buffered text, send it now as a text block
@@ -1890,14 +1820,10 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	}
 
 	for _, tc := range toolCalls {
-		// Anthropic streaming delivers tool_use input as input_json_delta
-		// fragments, not inside content_block_start. SDK clients (e.g. Claude
-		// Code) accumulate partial_json and ignore any input in the start
-		// event, so the full arguments must be sent as a delta or the client
-		// sees an empty input and loops.
-		partialJSON := strings.TrimSpace(tc.Function.Arguments)
-		if partialJSON == "" {
-			partialJSON = "{}"
+		var input any
+		json.Unmarshal([]byte(tc.Function.Arguments), &input)
+		if input == nil {
+			input = map[string]any{}
 		}
 		api.sendAnthropicSSE(w, "content_block_start", map[string]any{
 			"type":  "content_block_start",
@@ -1906,15 +1832,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 				"type":  "tool_use",
 				"id":    tc.ID,
 				"name":  tc.Function.Name,
-				"input": map[string]any{},
-			},
-		})
-		api.sendAnthropicSSE(w, "content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": blockIndex,
-			"delta": map[string]any{
-				"type":         "input_json_delta",
-				"partial_json": partialJSON,
+				"input": input,
 			},
 		})
 		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{
@@ -1992,26 +1910,7 @@ func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result too
 	w.Header().Set("Content-Type", "text/event-stream")
 	api.sendAnthropicSSE(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": response["id"], "type": "message", "role": "assistant", "content": []any{}, "model": model, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": countTokens(fmt.Sprint(messages)), "output_tokens": 0}}})
 	for i, block := range content {
-		switch block["type"] {
-		case "tool_use":
-			// tool_use input must stream as an input_json_delta fragment, not
-			// inline in content_block_start; SDK clients accumulate partial_json
-			// and otherwise see an empty input and loop forever.
-			start := map[string]any{"type": "tool_use", "id": block["id"], "name": block["name"], "input": map[string]any{}}
-			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": start})
-			partial, err := json.Marshal(block["input"])
-			if err != nil || len(partial) == 0 {
-				partial = []byte("{}")
-			}
-			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(partial)}})
-		case "text":
-			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": map[string]any{"type": "text", "text": ""}})
-			if txt, _ := block["text"].(string); txt != "" {
-				api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "text_delta", "text": txt}})
-			}
-		default:
-			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": block})
-		}
+		api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": block})
 		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
 	}
 	api.sendAnthropicSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": countTokens(result.text)}})
@@ -2039,8 +1938,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
-		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, sim)
+		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2224,8 +2122,7 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	// Parse simulated tool calls from buffered text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, sim)
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -2307,8 +2204,7 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 
 	// Parse simulated tool calls from response text
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, sim)
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2552,15 +2448,30 @@ func (api *APIServer) injectJSONMode(messages *[]payload.Message) {
 	*messages = append([]payload.Message{{Role: "system", Content: instruction}}, *messages...)
 }
 
-// chatAnthropicThinkingForOutput strips the simulated transport envelope from a
-// complete thinking string for non-streaming and OpenAI callers. It delegates
-// to toolcalling.FilterTransportThinking so every endpoint (streaming and
-// non-streaming) applies the exact same filter.
+var chatAnthropicSimulationMetaPattern = regexp.MustCompile(
+	`(?i)(generat\w*\s+(a\s+|the\s+)?json|chatcmpl-|chat\.completion|simulat\w+\s+(an?\s+)?(openai|anthropic)?\s*response|json\s+(code\s+)?block|"?tool_calls"?|"?finish_reason"?)`,
+)
+
 func chatAnthropicThinkingForOutput(thinking string, simulated bool) string {
 	if !simulated || thinking == "" {
 		return thinking
 	}
-	return toolcalling.FilterTransportThinking(thinking)
+
+	var output []string
+	inFence := false
+	for line := range strings.SplitSeq(thinking, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence || chatAnthropicSimulationMetaPattern.MatchString(line) {
+			continue
+		}
+		output = append(output, line)
+	}
+
+	return strings.TrimSpace(strings.Join(output, "\n"))
 }
 
 // injectSimulatedPrompt replaces the last user message with a simulated-mode
@@ -2933,7 +2844,7 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 		content:      text,
 		finishReason: "stop",
 	}
-	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames, toolcalling.RequiredArgsByTool(policy.tools))
+	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames)
 	if simulated.HasPayload {
 		result.content = simulated.Content
 		if len(simulated.ToolCalls) > 0 {
@@ -3031,7 +2942,6 @@ func responsesSimulationRetryMessages(
 			strings.Join(policy.allowedToolNames, ", "),
 		)
 	}
-	retryInstruction += " Every tool call MUST include all of its schema-required fields, each with a concrete non-empty value; a tool call with a missing or empty required field is invalid."
 
 	retried := append([]payload.Message(nil), messages...)
 	for index := range slices.Backward(retried) {
@@ -4207,43 +4117,6 @@ func (api *APIServer) streamResponses(
 		})
 	}
 
-	// Reasoning is streamed live; under simulated tool calling it passes through
-	// thinkingFilter first so the transport envelope never leaks. reasoningEmitted
-	// accumulates exactly what was published for the terminal done events.
-	var thinkingFilter toolcalling.ThinkingStreamFilter
-	var reasoningEmitted strings.Builder
-	reasoningFlushed := false
-	emitReasoning := func(delta string) {
-		if delta == "" {
-			return
-		}
-		reasoningEmitted.WriteString(delta)
-		if !reasoningItemEmitted {
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": 0,
-				"item": map[string]any{
-					"id":      reasoningID,
-					"type":    "reasoning",
-					"status":  "in_progress",
-					"summary": []map[string]any{{"type": "summary_text", "text": ""}},
-				},
-			})
-			sendEvent("response.reasoning_summary_part.added", map[string]any{
-				"item_id":       reasoningID,
-				"output_index":  0,
-				"summary_index": 0,
-				"part":          map[string]any{"type": "summary_text", "text": ""},
-			})
-			reasoningItemEmitted = true
-		}
-		sendEvent("response.reasoning_summary_text.delta", map[string]any{
-			"item_id":       reasoningID,
-			"output_index":  0,
-			"summary_index": 0,
-			"delta":         delta,
-		})
-	}
-
 	var finalConvID string
 	for chunk := range ch {
 		if chunk.Error != nil {
@@ -4259,26 +4132,48 @@ func (api *APIServer) streamResponses(
 			break
 		}
 
-		// Stream reasoning live. Under simulated tool calling it is filtered so
-		// the transport envelope never leaks; otherwise it passes through raw.
-		if chunk.Thinking != "" {
+		// Simulated tool prompts contain transport JSON in M365 thinking
+		// summaries. Never expose that content as Responses reasoning.
+		if chunk.Thinking != "" && !toolCallingEnabled {
 			thinkingText.WriteString(chunk.Thinking)
-			if toolCallingEnabled {
-				emitReasoning(thinkingFilter.Feed(chunk.Thinking))
-			} else {
-				emitReasoning(chunk.Thinking)
+
+			if !reasoningItemEmitted {
+				sendEvent("response.output_item.added", map[string]any{
+					"output_index": 0,
+					"item": map[string]any{
+						"id":     reasoningID,
+						"type":   "reasoning",
+						"status": "in_progress",
+						"summary": []map[string]any{
+							{
+								"type": "summary_text",
+								"text": "",
+							},
+						},
+					},
+				})
+				sendEvent("response.reasoning_summary_part.added", map[string]any{
+					"item_id":       reasoningID,
+					"output_index":  0,
+					"summary_index": 0,
+					"part": map[string]any{
+						"type": "summary_text",
+						"text": "",
+					},
+				})
+				reasoningItemEmitted = true
 			}
+			sendEvent("response.reasoning_summary_text.delta", map[string]any{
+				"item_id":       reasoningID,
+				"output_index":  0,
+				"summary_index": 0,
+				"delta":         chunk.Thinking,
+			})
 		}
 
 		// Handle text content
 		if chunk.Text != "" {
 			if toolCallingEnabled {
-				// Flush remaining reasoning before content so the reasoning item
-				// is fully emitted at output_index 0 ahead of the message item.
-				if !reasoningFlushed {
-					emitReasoning(thinkingFilter.Flush())
-					reasoningFlushed = true
-				}
 				// Keep the raw transport for final tool-call parsing, while
 				// publishing only decoded assistant content.
 				fullText += chunk.Text
@@ -4371,22 +4266,13 @@ func (api *APIServer) streamResponses(
 		return
 	}
 
-	// Flush any remaining filtered reasoning for the thinking-only case where no
-	// content chunk triggered the in-loop flush.
-	if toolCallingEnabled && !reasoningFlushed {
-		emitReasoning(thinkingFilter.Flush())
-		reasoningFlushed = true
-	}
-
-	// Finalize reasoning item if emitted. reasoningEmitted holds exactly what was
-	// published (raw for non-simulated, filtered under simulated tool calling).
-	if reasoningItemEmitted {
-		reasoningFinal := reasoningEmitted.String()
+	// Finalize reasoning item if emitted
+	if reasoningItemEmitted && !toolCallingEnabled {
 		sendEvent("response.reasoning_summary_text.done", map[string]any{
 			"item_id":       reasoningID,
 			"output_index":  0,
 			"summary_index": 0,
-			"text":          reasoningFinal,
+			"text":          thinkingText.String(),
 		})
 		sendEvent("response.reasoning_summary_part.done", map[string]any{
 			"item_id":       reasoningID,
@@ -4394,7 +4280,7 @@ func (api *APIServer) streamResponses(
 			"summary_index": 0,
 			"part": map[string]any{
 				"type": "summary_text",
-				"text": reasoningFinal,
+				"text": thinkingText.String(),
 			},
 		})
 		sendEvent("response.output_item.done", map[string]any{
@@ -4406,7 +4292,7 @@ func (api *APIServer) streamResponses(
 				"summary": []map[string]any{
 					{
 						"type": "summary_text",
-						"text": reasoningFinal,
+						"text": thinkingText.String(),
 					},
 				},
 			},
@@ -4898,7 +4784,7 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 
 	// In simulated mode, extract plain content
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			respText = sim.Content
 		}
@@ -5003,7 +4889,7 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 
 	// In simulated mode, extract plain content
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
 		if sim.HasPayload {
 			fullText = sim.Content
 		}
@@ -5486,25 +5372,4 @@ func extFromMediaType(mediaType string) string {
 	default:
 		return "png"
 	}
-}
-
-// sessionIDForMessages returns an explicit session ID from the request headers.
-// It returns the X-Session-Id header value when present, and an empty string
-// otherwise. Implicit (hash-derived) session IDs are intentionally not
-// returned here; callers that want a fallback should use getSessionID instead.
-func (api *APIServer) sessionIDForMessages(r *http.Request, _ []payload.Message) string {
-	return r.Header.Get("X-Session-Id")
-}
-
-// sessionIDForRequest resolves a session ID from explicit sources only.
-// Priority: body session_id > body user field > X-Session-Id header.
-// Returns an empty string when none of the explicit sources are set.
-func (api *APIServer) sessionIDForRequest(r *http.Request, sessionID, userID string, messages []payload.Message) string {
-	if sessionID != "" {
-		return sessionID
-	}
-	if userID != "" {
-		return userID
-	}
-	return api.sessionIDForMessages(r, messages)
 }

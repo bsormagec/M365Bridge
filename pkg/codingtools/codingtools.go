@@ -205,7 +205,7 @@ func protected(path string) bool {
 	if p == ".env" || p == "data/.env" || p == "data/tokens" || strings.HasPrefix(p, "data/tokens/") {
 		return true
 	}
-	for _, part := range strings.Split(p, "/") {
+	for part := range strings.SplitSeq(p, "/") {
 		for _, word := range []string{"credential", "token", "cookie", "secret", "private_key", "private-key"} {
 			if strings.Contains(part, word) {
 				return true
@@ -360,7 +360,7 @@ func (m *Manager) applyPatch(ctx context.Context, a map[string]any) (string, boo
 	if int64(len(patch)) > m.config.MaxReadBytes {
 		return "", false, errors.New("patch exceeds input limit")
 	}
-	for _, line := range strings.Split(patch, "\n") {
+	for line := range strings.SplitSeq(patch, "\n") {
 		if strings.HasPrefix(line, "+++ ") || strings.HasPrefix(line, "--- ") {
 			fields := strings.Fields(strings.TrimPrefix(strings.TrimPrefix(line, "+++ "), "--- "))
 			if len(fields) == 0 {
