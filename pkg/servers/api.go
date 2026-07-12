@@ -539,6 +539,27 @@ func (api *APIServer) hashSessionIDFromMessages(r *http.Request, messages []payl
 	return "h:" + hex.EncodeToString(h[:])
 }
 
+// sessionIDForMessages resolves the fallback session identity for endpoints
+// whose request body has already been decoded into typed messages. Keeping the
+// fallback based on the first user message makes requests from clients that do
+// not send X-Session-Id continue the same M365 conversation.
+func (api *APIServer) sessionIDForMessages(r *http.Request, messages []payload.Message) string {
+	if sid := r.Header.Get("X-Session-Id"); sid != "" {
+		return sid
+	}
+	return api.hashSessionIDFromMessages(r, messages)
+}
+
+func (api *APIServer) sessionIDForRequest(r *http.Request, explicitID, user string, messages []payload.Message) string {
+	if explicitID != "" {
+		return explicitID
+	}
+	if user != "" {
+		return user
+	}
+	return api.sessionIDForMessages(r, messages)
+}
+
 type toolLoopProvider int
 
 const (
@@ -831,7 +852,7 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 	// Resolve session ID and conversation ID
 	sid := modelSessionID
 	if sid == "" {
-		sid = api.getSessionID(r, nil)
+		sid = api.sessionIDForMessages(r, messages)
 	}
 	var convID string
 	if sid != "" {
@@ -938,6 +959,8 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	var req struct {
 		Model       string                `json:"model"`
 		Messages    []payload.Message     `json:"messages"`
+		SessionID   string                `json:"session_id"`
+		User        string                `json:"user"`
 		System      json.RawMessage       `json:"system"`
 		MaxTokens   int                   `json:"max_tokens"`
 		Stream      bool                  `json:"stream"`
@@ -983,7 +1006,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	// Resolve session ID and conversation ID
 	sid := modelSessionID
 	if sid == "" {
-		sid = api.getSessionID(r, nil)
+		sid = api.sessionIDForRequest(r, req.SessionID, req.User, chatMessages)
 	}
 	var convID string
 	if sid != "" {
@@ -1045,7 +1068,7 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 	// Resolve session ID and conversation ID
 	sid := modelSessionID
 	if sid == "" {
-		sid = api.getSessionID(r, nil)
+		sid = api.sessionIDForMessages(r, messages)
 	}
 	var convID string
 	if sid != "" {

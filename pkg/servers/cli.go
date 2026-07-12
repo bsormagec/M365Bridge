@@ -11,6 +11,7 @@ import (
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 )
 
 // CLIServer handles command-line interface operations.
@@ -76,6 +77,7 @@ func (cli *CLIServer) runInteractive(options *CLIOptions) error {
 	fmt.Println("Exit: Ctrl+C")
 
 	reader := bufio.NewReader(os.Stdin)
+	conversationID := ""
 
 	for {
 		fmt.Print("\n> ")
@@ -96,14 +98,28 @@ func (cli *CLIServer) runInteractive(options *CLIOptions) error {
 		}
 
 		if options.NoStream {
-			result, chatErr := cli.m365Client.Chat(text, tone, cfg.Override, "", cli.config.UserOID, cli.config.TenantID, false)
+			result, _, _, _, nextConversationID, chatErr := cli.m365Client.ChatConversation(
+				[]payload.Message{{Role: "user", Content: text}},
+				tone,
+				cfg.Override,
+				conversationID,
+				cli.config.UserOID,
+				cli.config.TenantID,
+				false,
+			)
 			err = chatErr
+			if chatErr == nil && nextConversationID != "" {
+				conversationID = nextConversationID
+			}
 			if err == nil && result != "" {
 				fmt.Println(result)
 			}
 		} else {
 			fmt.Println()
-			_, err = cli.streamToStdout(text, tone, cfg.Override, "")
+			_, nextConversationID, err := cli.streamToStdout(text, tone, cfg.Override, conversationID)
+			if err == nil && nextConversationID != "" {
+				conversationID = nextConversationID
+			}
 			fmt.Println()
 		}
 
@@ -135,7 +151,7 @@ func (cli *CLIServer) runSingleQuery(options *CLIOptions) error {
 			fmt.Println(result)
 		}
 	} else {
-		_, err = cli.streamToStdout(options.Prompt, tone, cfg.Override, "")
+		_, _, err = cli.streamToStdout(options.Prompt, tone, cfg.Override, "")
 	}
 
 	if err != nil {
@@ -146,19 +162,22 @@ func (cli *CLIServer) runSingleQuery(options *CLIOptions) error {
 }
 
 // streamToStdout streams the response directly to stdout and returns the full text.
-func (cli *CLIServer) streamToStdout(text, tone, gptOverride, convID string) (string, error) {
+func (cli *CLIServer) streamToStdout(text, tone, gptOverride, convID string) (string, string, error) {
 	fullText := ""
+	conversationID := ""
 	ch := cli.m365Client.ChatStreamGen(text, tone, gptOverride, convID, cli.config.UserOID, cli.config.TenantID, false)
 	for chunk := range ch {
 		if chunk.Error != nil {
-			return fullText, chunk.Error
+			return fullText, conversationID, chunk.Error
 		}
 		if !chunk.IsFinal {
 			fmt.Print(chunk.Text)
 			fullText += chunk.Text
+		} else if chunk.ConversationID != "" {
+			conversationID = chunk.ConversationID
 		}
 	}
-	return fullText, nil
+	return fullText, conversationID, nil
 }
 
 // Close cleans up resources.
