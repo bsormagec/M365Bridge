@@ -1,6 +1,7 @@
 package servers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -824,6 +825,308 @@ func TestResponsesResultRequiresVisibleOutput(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResponsesEmptyRetryBudgetIsSingleFreshAttempt(t *testing.T) {
+	if len(responsesEmptyRetryDelays) != 1 {
+		t.Fatalf(
+			"empty retry delays = %d, want exactly one retry",
+			len(responsesEmptyRetryDelays),
+		)
+	}
+}
+
+func TestResponsesConversationRetriesEmptyCompletion(t *testing.T) {
+	attempts := 0
+	conversationIDs := []string{}
+	retryHooks := 0
+
+	result, err := responsesConversationWithEmptyRetry(
+		context.Background(),
+		"conv-poisoned",
+		[]time.Duration{0},
+		func() {
+			retryHooks++
+		},
+		func(_ context.Context, conversationID string) (responsesConversationResult, error) {
+			attempts++
+			conversationIDs = append(conversationIDs, conversationID)
+			if attempts == 1 {
+				return responsesConversationResult{}, nil
+			}
+			return responsesConversationResult{
+				text:           "recovered",
+				finishReason:   "stop",
+				conversationID: "conv-recovered",
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("empty completion retry failed: %v", err)
+	}
+	if result.text != "recovered" {
+		t.Fatalf("retried text = %q, want recovered", result.text)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if retryHooks != 1 {
+		t.Fatalf("retry hooks = %d, want 1", retryHooks)
+	}
+	if got := strings.Join(conversationIDs, ","); got != "conv-poisoned," {
+		t.Fatalf("conversation IDs = %q, want poisoned then fresh", got)
+	}
+}
+
+func TestResponsesConversationEmptyRetryIsBounded(t *testing.T) {
+	attempts := 0
+
+	result, err := responsesConversationWithEmptyRetry(
+		context.Background(),
+		"",
+		[]time.Duration{0},
+		nil,
+		func(_ context.Context, _ string) (responsesConversationResult, error) {
+			attempts++
+			return responsesConversationResult{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("bounded empty retry returned error: %v", err)
+	}
+	if !responsesResultEmpty(result.text, result.toolCalls) {
+		t.Fatalf("exhausted retry unexpectedly returned visible output: %#v", result)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestResponsesStreamRetriesEmptyCompletionBeforeEmitting(t *testing.T) {
+	attempts := 0
+	conversationIDs := []string{}
+	retryHooks := 0
+
+	ch := responsesStreamWithEmptyRetry(
+		context.Background(),
+		"conv-poisoned",
+		[]time.Duration{0},
+		false,
+		func() {
+			retryHooks++
+		},
+		func(_ context.Context, conversationID string) <-chan client.StreamChunk {
+			attempts++
+			conversationIDs = append(conversationIDs, conversationID)
+			if attempts == 1 {
+				return responsesTestChunkStream(client.StreamChunk{
+					IsFinal:        true,
+					ConversationID: "conv-empty",
+					FinishReason:   "stop",
+				})
+			}
+			return responsesTestChunkStream(
+				client.StreamChunk{Text: "recovered"},
+				client.StreamChunk{
+					IsFinal:        true,
+					ConversationID: "conv-recovered",
+					FinishReason:   "stop",
+				},
+			)
+		},
+	)
+
+	chunks := []client.StreamChunk{}
+	for chunk := range ch {
+		chunks = append(chunks, chunk)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if retryHooks != 1 {
+		t.Fatalf("retry hooks = %d, want 1", retryHooks)
+	}
+	if got := strings.Join(conversationIDs, ","); got != "conv-poisoned," {
+		t.Fatalf("conversation IDs = %q, want poisoned then fresh", got)
+	}
+	if len(chunks) != 2 || chunks[0].Text != "recovered" ||
+		!chunks[1].IsFinal {
+		t.Fatalf("unexpected retried stream: %#v", chunks)
+	}
+}
+
+func TestResponsesStreamEmptyRetryStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+
+	ch := responsesStreamWithEmptyRetry(
+		ctx,
+		"",
+		[]time.Duration{time.Hour},
+		false,
+		nil,
+		func(_ context.Context, _ string) <-chan client.StreamChunk {
+			attempts++
+			cancel()
+			return responsesTestChunkStream(client.StreamChunk{
+				IsFinal: true,
+			})
+		},
+	)
+
+	for range ch {
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts after cancellation = %d, want 1", attempts)
+	}
+}
+
+func TestResponsesStreamDoesNotRetryAfterVisibleChunk(t *testing.T) {
+	attempts := 0
+
+	ch := responsesStreamWithEmptyRetry(
+		context.Background(),
+		"",
+		[]time.Duration{0, 0},
+		false,
+		nil,
+		func(_ context.Context, _ string) <-chan client.StreamChunk {
+			attempts++
+			return responsesTestChunkStream(
+				client.StreamChunk{Thinking: "working"},
+				client.StreamChunk{IsFinal: true},
+			)
+		},
+	)
+
+	chunks := []client.StreamChunk{}
+	for chunk := range ch {
+		chunks = append(chunks, chunk)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 after visible output", attempts)
+	}
+	if len(chunks) != 2 || chunks[0].Thinking != "working" ||
+		!chunks[1].IsFinal {
+		t.Fatalf("visible stream changed: %#v", chunks)
+	}
+}
+
+func TestResponsesStreamDoesNotRetryFinalToolCall(t *testing.T) {
+	attempts := 0
+	toolCall := client.ToolCall{
+		ID:   "call_test",
+		Type: "function",
+		Function: client.ToolCallFunction{
+			Name:      "read_nonce",
+			Arguments: `{}`,
+		},
+	}
+
+	ch := responsesStreamWithEmptyRetry(
+		context.Background(),
+		"",
+		[]time.Duration{0, 0},
+		false,
+		nil,
+		func(_ context.Context, _ string) <-chan client.StreamChunk {
+			attempts++
+			return responsesTestChunkStream(client.StreamChunk{
+				IsFinal:   true,
+				ToolCalls: []client.ToolCall{toolCall},
+			})
+		},
+	)
+
+	chunks := []client.StreamChunk{}
+	for chunk := range ch {
+		chunks = append(chunks, chunk)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 for a final tool call", attempts)
+	}
+	if len(chunks) != 1 || len(chunks[0].ToolCalls) != 1 {
+		t.Fatalf("tool-call stream changed: %#v", chunks)
+	}
+}
+
+func TestResponsesStreamBufferedSimulationRetriesBeforePublishing(t *testing.T) {
+	attempts := 0
+
+	ch := responsesStreamWithEmptyRetry(
+		context.Background(),
+		"conv-poisoned",
+		[]time.Duration{0},
+		true,
+		nil,
+		func(_ context.Context, _ string) <-chan client.StreamChunk {
+			attempts++
+			if attempts == 1 {
+				return responsesTestChunkStream(
+					client.StreamChunk{Thinking: "hidden transport reasoning"},
+					client.StreamChunk{
+						IsFinal: true,
+						ToolCalls: []client.ToolCall{{
+							ID: "backend-only",
+						}},
+					},
+				)
+			}
+			return responsesTestChunkStream(
+				client.StreamChunk{Text: "recovered"},
+				client.StreamChunk{IsFinal: true},
+			)
+		},
+	)
+
+	chunks := []client.StreamChunk{}
+	for chunk := range ch {
+		chunks = append(chunks, chunk)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if len(chunks) != 2 || chunks[0].Text != "recovered" ||
+		chunks[0].Thinking != "" || !chunks[1].IsFinal {
+		t.Fatalf("buffered retry exposed discarded attempt: %#v", chunks)
+	}
+}
+
+func TestResponsesStreamWithoutFinalReturnsUpstreamError(t *testing.T) {
+	attempts := 0
+
+	ch := responsesStreamWithEmptyRetry(
+		context.Background(),
+		"",
+		[]time.Duration{0},
+		false,
+		nil,
+		func(_ context.Context, _ string) <-chan client.StreamChunk {
+			attempts++
+			return responsesTestChunkStream(client.StreamChunk{Text: "partial"})
+		},
+	)
+
+	chunks := []client.StreamChunk{}
+	for chunk := range ch {
+		chunks = append(chunks, chunk)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 for a broken stream", attempts)
+	}
+	if len(chunks) != 2 || chunks[0].Text != "partial" ||
+		chunks[1].Error == nil {
+		t.Fatalf("broken stream did not end with an error: %#v", chunks)
+	}
+}
+
+func responsesTestChunkStream(chunks ...client.StreamChunk) <-chan client.StreamChunk {
+	ch := make(chan client.StreamChunk, len(chunks))
+	for _, chunk := range chunks {
+		ch <- chunk
+	}
+	close(ch)
+	return ch
 }
 
 func TestWriteResponsesUpstreamEmptyErrorNonStreaming(t *testing.T) {

@@ -2950,6 +2950,176 @@ func responsesResultEmpty(text string, toolCalls []client.ToolCall) bool {
 	return strings.TrimSpace(text) == "" && len(toolCalls) == 0
 }
 
+var responsesEmptyRetryDelays = []time.Duration{
+	250 * time.Millisecond,
+}
+
+type responsesConversationResult struct {
+	text           string
+	thinking       string
+	toolCalls      []client.ToolCall
+	finishReason   string
+	conversationID string
+}
+
+type responsesConversationCall func(
+	context.Context,
+	string,
+) (responsesConversationResult, error)
+
+func waitForResponsesEmptyRetry(
+	ctx context.Context,
+	delay time.Duration,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func responsesConversationWithEmptyRetry(
+	ctx context.Context,
+	initialConversationID string,
+	retryDelays []time.Duration,
+	onRetry func(),
+	call responsesConversationCall,
+) (responsesConversationResult, error) {
+	conversationID := initialConversationID
+	for attempt := 0; ; attempt++ {
+		result, err := call(ctx, conversationID)
+		if err != nil ||
+			!responsesResultEmpty(result.text, result.toolCalls) ||
+			attempt >= len(retryDelays) {
+			return result, err
+		}
+
+		logging.Warnf(
+			"Responses upstream completed empty; retrying attempt=%d/%d",
+			attempt+2,
+			len(retryDelays)+1,
+		)
+		if onRetry != nil {
+			onRetry()
+		}
+		if err := waitForResponsesEmptyRetry(
+			ctx,
+			retryDelays[attempt],
+		); err != nil {
+			return responsesConversationResult{}, err
+		}
+		conversationID = ""
+	}
+}
+
+type responsesStreamCall func(
+	context.Context,
+	string,
+) <-chan client.StreamChunk
+
+func responsesStreamWithEmptyRetry(
+	ctx context.Context,
+	initialConversationID string,
+	retryDelays []time.Duration,
+	bufferUntilFinal bool,
+	onRetry func(),
+	call responsesStreamCall,
+) <-chan client.StreamChunk {
+	output := make(chan client.StreamChunk)
+	go func() {
+		defer close(output)
+		conversationID := initialConversationID
+		emit := func(chunk client.StreamChunk) bool {
+			select {
+			case output <- chunk:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
+		for attempt := 0; ; attempt++ {
+			stream := call(ctx, conversationID)
+			sawVisibleChunk := false
+			sawFinal := false
+			bufferedChunks := []client.StreamChunk{}
+
+			for chunk := range stream {
+				if chunk.Error != nil {
+					emit(chunk)
+					return
+				}
+				if chunk.IsFinal {
+					sawFinal = true
+					finalToolCallsVisible :=
+						!bufferUntilFinal && len(chunk.ToolCalls) > 0
+					if sawVisibleChunk || finalToolCallsVisible ||
+						attempt >= len(retryDelays) {
+						for _, buffered := range bufferedChunks {
+							if !emit(buffered) {
+								return
+							}
+						}
+						emit(chunk)
+						return
+					}
+					break
+				}
+				if bufferUntilFinal {
+					bufferedChunks = append(bufferedChunks, chunk)
+					if strings.TrimSpace(chunk.Text) != "" {
+						sawVisibleChunk = true
+					}
+					continue
+				}
+				if chunk.Text == "" && chunk.Thinking == "" {
+					continue
+				}
+				sawVisibleChunk = true
+				if !emit(chunk) {
+					return
+				}
+			}
+
+			if !sawFinal {
+				if ctx.Err() == nil {
+					emit(client.StreamChunk{Error: client.ErrConnectionClosed})
+				}
+				return
+			}
+			if attempt >= len(retryDelays) {
+				return
+			}
+
+			logging.Warnf(
+				"Responses upstream stream completed empty; retrying attempt=%d/%d",
+				attempt+2,
+				len(retryDelays)+1,
+			)
+			if onRetry != nil {
+				onRetry()
+			}
+			if err := waitForResponsesEmptyRetry(
+				ctx,
+				retryDelays[attempt],
+			); err != nil {
+				return
+			}
+			conversationID = ""
+		}
+	}()
+	return output
+}
+
 func buildResponsesFailedEvent(
 	responseID, model, code, message string,
 	sequenceNumber int,
@@ -3245,7 +3415,16 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 			toolPolicy,
 		)
 	} else {
-		api.nonStreamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, toolPolicy)
+		api.nonStreamResponses(
+			r.Context(),
+			w,
+			messages,
+			cfg,
+			sid,
+			convID,
+			req.MaxOutputTokens,
+			toolPolicy,
+		)
 	}
 }
 
@@ -3506,16 +3685,102 @@ func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result too
 	fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", completed)
 }
 
+func (api *APIServer) responsesConversationOnce(
+	ctx context.Context,
+	messages []payload.Message,
+	cfg models.ModelConfig,
+	conversationID string,
+	simulateTools bool,
+) (responsesConversationResult, error) {
+	text, thinking, toolCalls, finishReason, finalConversationID, err :=
+		api.m365Client.ChatConversationContext(
+			ctx,
+			messages,
+			cfg.Tone,
+			cfg.Override,
+			conversationID,
+			api.config.UserOID,
+			api.config.TenantID,
+			simulateTools,
+		)
+	return responsesConversationResult{
+		text:           text,
+		thinking:       thinking,
+		toolCalls:      toolCalls,
+		finishReason:   finishReason,
+		conversationID: finalConversationID,
+	}, err
+}
+
+func (api *APIServer) responsesConversation(
+	ctx context.Context,
+	messages []payload.Message,
+	cfg models.ModelConfig,
+	conversationID string,
+	simulateTools bool,
+	onRetry func(),
+) (responsesConversationResult, error) {
+	return responsesConversationWithEmptyRetry(
+		ctx,
+		conversationID,
+		responsesEmptyRetryDelays,
+		onRetry,
+		func(
+			callContext context.Context,
+			callConversationID string,
+		) (responsesConversationResult, error) {
+			result, err := api.responsesConversationOnce(
+				callContext,
+				messages,
+				cfg,
+				callConversationID,
+				simulateTools,
+			)
+			if simulateTools {
+				result.toolCalls = nil
+			}
+			return result, err
+		},
+	)
+}
+
 // nonStreamResponses handles non-streaming Responses API requests.
-func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, toolPolicy responsesToolPolicy) {
-	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, toolPolicy.simulate)
+func (api *APIServer) nonStreamResponses(
+	ctx context.Context,
+	w http.ResponseWriter,
+	messages []payload.Message,
+	cfg models.ModelConfig,
+	sid, convID string,
+	maxTokens int,
+	toolPolicy responsesToolPolicy,
+) {
+	result, err := api.responsesConversation(
+		ctx,
+		messages,
+		cfg,
+		convID,
+		toolPolicy.simulate,
+		func() {
+			if sid != "" {
+				api.ctxCache.Delete("session:" + sid)
+			}
+		},
+	)
 	if err != nil {
 		if sid != "" {
 			api.ctxCache.Delete("session:" + sid)
 		}
+		if ctx.Err() != nil {
+			return
+		}
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
 	}
+	respText := result.text
+	thinking := result.thinking
+	toolCalls := result.toolCalls
+	finishReason := result.finishReason
+	finalConvID := result.conversationID
 
 	// In simulated mode, discard backend-injected tool calls
 	if toolPolicy.simulate {
@@ -3528,31 +3793,30 @@ func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []paylo
 			respText,
 			toolPolicy,
 			func() (string, error) {
-				retryText, retryThinking, retryToolCalls,
-					retryFinishReason, retryConvID, retryErr :=
-					api.m365Client.ChatConversation(
-						responsesSimulationRetryMessages(messages, toolPolicy),
-						cfg.Tone,
-						cfg.Override,
-						"",
-						api.config.UserOID,
-						api.config.TenantID,
-						true,
-					)
+				retryResult, retryErr := api.responsesConversationOnce(
+					ctx,
+					responsesSimulationRetryMessages(messages, toolPolicy),
+					cfg,
+					"",
+					true,
+				)
 				if retryErr != nil {
 					return "", retryErr
 				}
-				respText = retryText
-				thinking = retryThinking
-				toolCalls = retryToolCalls
-				finishReason = retryFinishReason
-				finalConvID = retryConvID
-				return retryText, nil
+				respText = retryResult.text
+				thinking = retryResult.thinking
+				toolCalls = retryResult.toolCalls
+				finishReason = retryResult.finishReason
+				finalConvID = retryResult.conversationID
+				return retryResult.text, nil
 			},
 		)
 		if parseErr != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
+			}
+			if ctx.Err() != nil {
+				return
 			}
 			writeResponsesSimulationError(w, false, "", cfg.OpenAIID, parseErr)
 			return
@@ -3672,15 +3936,31 @@ func (api *APIServer) streamResponses(
 		},
 	})
 
-	ch := api.m365Client.ChatConversationStreamGenContext(
+	ch := responsesStreamWithEmptyRetry(
 		ctx,
-		messages,
-		cfg.Tone,
-		cfg.Override,
 		convID,
-		api.config.UserOID,
-		api.config.TenantID,
+		responsesEmptyRetryDelays,
 		toolPolicy.simulate,
+		func() {
+			if sid != "" {
+				api.ctxCache.Delete("session:" + sid)
+			}
+		},
+		func(
+			callContext context.Context,
+			callConversationID string,
+		) <-chan client.StreamChunk {
+			return api.m365Client.ChatConversationStreamGenContext(
+				callContext,
+				messages,
+				cfg.Tone,
+				cfg.Override,
+				callConversationID,
+				api.config.UserOID,
+				api.config.TenantID,
+				toolPolicy.simulate,
+			)
+		},
 	)
 
 	fullText := ""
@@ -3891,29 +4171,29 @@ func (api *APIServer) streamResponses(
 			fullText,
 			toolPolicy,
 			func() (string, error) {
-				retryText, _, _, _, retryConvID, retryErr :=
-					api.m365Client.ChatConversation(
-						responsesSimulationRetryMessages(messages, toolPolicy),
-						cfg.Tone,
-						cfg.Override,
-						"",
-						api.config.UserOID,
-						api.config.TenantID,
-						true,
-					)
+				retryResult, retryErr := api.responsesConversationOnce(
+					ctx,
+					responsesSimulationRetryMessages(messages, toolPolicy),
+					cfg,
+					"",
+					true,
+				)
 				if retryErr != nil {
 					return "", retryErr
 				}
-				fullText = retryText
-				finalConvID = retryConvID
+				fullText = retryResult.text
+				finalConvID = retryResult.conversationID
 				contentExtractor = toolcalling.ContentStreamExtractor{}
-				contentExtractor.Feed(retryText)
-				return retryText, nil
+				contentExtractor.Feed(retryResult.text)
+				return retryResult.text, nil
 			},
 		)
 		if parseErr != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
+			}
+			if ctx.Err() != nil {
+				return
 			}
 			sendFailed(simulatedToolCallRequiredCode, parseErr.Error())
 			return

@@ -270,8 +270,37 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 // When hasTools is true, code_interpreter option flags are stripped from the payload.
 // Returns (text, thinking, toolCalls, finishReason, conversationID, error).
 func (c *M365Client) ChatConversation(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, string, []ToolCall, string, string, error) {
+	return c.ChatConversationContext(
+		context.Background(),
+		messages,
+		tone,
+		gptOverride,
+		conversationID,
+		userOID,
+		tenantID,
+		hasTools,
+	)
+}
+
+// ChatConversationContext sends a conversation and stops waiting when ctx is
+// canceled.
+func (c *M365Client) ChatConversationContext(
+	ctx context.Context,
+	messages []payload.Message,
+	tone, gptOverride, conversationID, userOID, tenantID string,
+	hasTools bool,
+) (string, string, []ToolCall, string, string, error) {
 	logging.Infof("ChatConversation: tone=%s override=%s convID=%s hasTools=%v msgs=%d", tone, gptOverride, conversationID, hasTools, len(messages))
-	ch := c.ChatConversationStreamGen(messages, tone, gptOverride, conversationID, userOID, tenantID, hasTools)
+	ch := c.ChatConversationStreamGenContext(
+		ctx,
+		messages,
+		tone,
+		gptOverride,
+		conversationID,
+		userOID,
+		tenantID,
+		hasTools,
+	)
 
 	var fullText, thinking, convID string
 	var toolCalls []ToolCall
@@ -291,6 +320,9 @@ func (c *M365Client) ChatConversation(messages []payload.Message, tone, gptOverr
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return "", "", nil, "", "", err
+	}
 	return cleanText(fullText), thinking, toolCalls, finishReason, convID, nil
 }
 
