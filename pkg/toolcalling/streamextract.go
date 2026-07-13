@@ -76,9 +76,12 @@ func (e *ContentStreamExtractor) Commit(allowedToolNames []string) string {
 	if e.done {
 		return ""
 	}
+	// Commit consumes only the parsed content delta, never tool calls, so
+	// argument validation is unnecessary here.
 	result := ParseSimulatedResponseResponses(
 		e.ParseText(),
 		allowedToolNames,
+		nil,
 	)
 	e.done = true
 	if !strings.HasPrefix(result.Content, e.text) {

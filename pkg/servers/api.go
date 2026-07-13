@@ -632,9 +632,9 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 		}
 		var simulated toolcalling.SimulatedResult
 		if provider == toolLoopAnthropic {
-			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools))
+			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		} else {
-			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools))
+			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		}
 		if !simulated.HasPayload || len(simulated.ToolCalls) == 0 {
 			if simulated.HasPayload {
@@ -1329,7 +1329,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -1510,7 +1510,7 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -1743,7 +1743,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools))
+		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -1939,7 +1939,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 
 	// Parse simulated tool calls from response text
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools))
+		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2119,7 +2119,7 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	// Parse simulated tool calls from buffered text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -2201,7 +2201,7 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 
 	// Parse simulated tool calls from response text
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2842,7 +2842,7 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 		content:      text,
 		finishReason: "stop",
 	}
-	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames)
+	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames, toolcalling.RequiredArgsByTool(policy.tools))
 	if simulated.HasPayload {
 		result.content = simulated.Content
 		if len(simulated.ToolCalls) > 0 {
@@ -4782,7 +4782,7 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 
 	// In simulated mode, extract plain content
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		if sim.HasPayload {
 			respText = sim.Content
 		}
@@ -4887,7 +4887,7 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 
 	// In simulated mode, extract plain content
 	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		if sim.HasPayload {
 			fullText = sim.Content
 		}
