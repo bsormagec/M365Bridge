@@ -1868,10 +1868,14 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	}
 
 	for _, tc := range toolCalls {
-		var input any
-		json.Unmarshal([]byte(tc.Function.Arguments), &input)
-		if input == nil {
-			input = map[string]any{}
+		// Anthropic streaming delivers tool_use input as input_json_delta
+		// fragments, not inside content_block_start. SDK clients (e.g. Claude
+		// Code) accumulate partial_json and ignore any input in the start
+		// event, so the full arguments must be sent as a delta or the client
+		// sees an empty input and loops.
+		partialJSON := strings.TrimSpace(tc.Function.Arguments)
+		if partialJSON == "" {
+			partialJSON = "{}"
 		}
 		api.sendAnthropicSSE(w, "content_block_start", map[string]any{
 			"type":  "content_block_start",
@@ -1880,7 +1884,15 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 				"type":  "tool_use",
 				"id":    tc.ID,
 				"name":  tc.Function.Name,
-				"input": input,
+				"input": map[string]any{},
+			},
+		})
+		api.sendAnthropicSSE(w, "content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": blockIndex,
+			"delta": map[string]any{
+				"type":         "input_json_delta",
+				"partial_json": partialJSON,
 			},
 		})
 		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{

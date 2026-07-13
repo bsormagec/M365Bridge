@@ -406,9 +406,11 @@ Streaming remains Anthropic-native:
 1. `message_start`
 2. optional thinking events
 3. optional text block events
-4. one `content_block_start` and `content_block_stop` pair per `tool_use`
+4. per `tool_use`: `content_block_start` with an empty `input`, then a `content_block_delta` carrying the full arguments as an `input_json_delta` `partial_json` string, then `content_block_stop`
 5. `message_delta` with `stop_reason: "tool_use"`
 6. `message_stop`
+
+Step 4 must stream the arguments as `input_json_delta`, not inline them in `content_block_start.input`. SDK clients (Claude Code) build tool input by accumulating `partial_json` and ignore the `input` on the start event; inlining the arguments makes the client see an empty input and retry the tool call in an endless loop. See `pkg/servers/api.go` in `streamAnthropicMessages`.
 
 See `pkg/servers/api.go::1551`.
 
