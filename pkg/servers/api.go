@@ -1970,7 +1970,26 @@ func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result too
 	w.Header().Set("Content-Type", "text/event-stream")
 	api.sendAnthropicSSE(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": response["id"], "type": "message", "role": "assistant", "content": []any{}, "model": model, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": countTokens(fmt.Sprint(messages)), "output_tokens": 0}}})
 	for i, block := range content {
-		api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": block})
+		switch block["type"] {
+		case "tool_use":
+			// tool_use input must stream as an input_json_delta fragment, not
+			// inline in content_block_start; SDK clients accumulate partial_json
+			// and otherwise see an empty input and loop forever.
+			start := map[string]any{"type": "tool_use", "id": block["id"], "name": block["name"], "input": map[string]any{}}
+			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": start})
+			partial, err := json.Marshal(block["input"])
+			if err != nil || len(partial) == 0 {
+				partial = []byte("{}")
+			}
+			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(partial)}})
+		case "text":
+			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": map[string]any{"type": "text", "text": ""}})
+			if txt, _ := block["text"].(string); txt != "" {
+				api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "text_delta", "text": txt}})
+			}
+		default:
+			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": block})
+		}
 		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
 	}
 	api.sendAnthropicSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": countTokens(result.text)}})
