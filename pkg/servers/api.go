@@ -1686,6 +1686,8 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	// Stream content with optional thinking block
 	fullText := ""
 	var thinkingText strings.Builder
+	var thinkingFilter toolcalling.ThinkingStreamFilter
+	thinkingClosed := false
 	truncated := false
 	thinkingBlockOpen := false
 	textBlockOpen := false
@@ -1722,6 +1724,17 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 		if chunk.Thinking != "" {
 			thinkingText.WriteString(chunk.Thinking)
 			if toolCallingEnabled {
+				// Live-stream thinking through a stateful filter that strips the
+				// simulated transport envelope (fenced blocks + meta-prose) so
+				// the model's reasoning is visible without exposing the mechanism.
+				if emit := thinkingFilter.Feed(chunk.Thinking); emit != "" {
+					if !thinkingBlockOpen {
+						api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+						thinkingBlockOpen = true
+					}
+					api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": emit}})
+					flusher.Flush()
+				}
 				continue
 			}
 			if !thinkingBlockOpen {
@@ -1743,7 +1756,18 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 			continue
 		}
 
-		// Transition from thinking to text
+		// Transition from thinking to text: flush the filter remainder (tool
+		// path) then close any open thinking block before content follows.
+		if toolCallingEnabled && !thinkingClosed {
+			if rem := thinkingFilter.Flush(); rem != "" {
+				if !thinkingBlockOpen {
+					api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+					thinkingBlockOpen = true
+				}
+				api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": rem}})
+			}
+			thinkingClosed = true
+		}
 		if thinkingBlockOpen && !textBlockOpen {
 			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
 			blockIndex++
@@ -1798,26 +1822,22 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 		}
 	}
 
-	if toolCallingEnabled {
-		thinkingOutput := chatAnthropicThinkingForOutput(thinkingText.String(), true)
-		if thinkingOutput != "" {
-			api.sendAnthropicSSE(w, "content_block_start", map[string]any{
-				"type":          "content_block_start",
-				"index":         blockIndex,
-				"content_block": map[string]any{"type": "thinking", "thinking": ""},
-			})
-			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": blockIndex,
-				"delta": map[string]any{"type": "thinking_delta", "thinking": thinkingOutput},
-			})
-			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{
-				"type":  "content_block_stop",
-				"index": blockIndex,
-			})
-			blockIndex++
-			flusher.Flush()
+	// Flush any remaining filtered thinking when the response was thinking-only
+	// (no content chunk triggered the in-loop transition) and close its block.
+	if toolCallingEnabled && !thinkingClosed {
+		if rem := thinkingFilter.Flush(); rem != "" {
+			if !thinkingBlockOpen {
+				api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+				thinkingBlockOpen = true
+			}
+			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": rem}})
 		}
+		if thinkingBlockOpen {
+			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
+			blockIndex++
+			thinkingBlockOpen = false
+		}
+		thinkingClosed = true
 	}
 
 	// If tool calling buffered text, send it now as a text block
