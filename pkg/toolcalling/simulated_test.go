@@ -262,3 +262,48 @@ func TestRequiredArgsByToolReadsBothSchemaShapes(t *testing.T) {
 		t.Fatalf("NoSchema required = %v, want empty", got["NoSchema"])
 	}
 }
+
+func TestParseSimulatedResponseAnthropicReportsDroppedMissingArgs(t *testing.T) {
+	raw := `{
+		"type": "message",
+		"role": "assistant",
+		"stop_reason": "tool_use",
+		"content": [
+			{"type": "tool_use", "id": "toolu_bad", "name": "Agent", "input": {"prompt": "do it"}}
+		]
+	}`
+
+	result := ParseSimulatedResponseAnthropic(raw, []string{"Agent"}, agentRequiredByTool())
+
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("expected the malformed tool_use to be dropped, got %#v", result.ToolCalls)
+	}
+	if want := []string{"Agent"}; strings.Join(result.DroppedMissingArgs, ",") != strings.Join(want, ",") {
+		t.Fatalf("DroppedMissingArgs = %v, want %v", result.DroppedMissingArgs, want)
+	}
+}
+
+func TestParseSimulatedResponseReportsDroppedMissingArgs(t *testing.T) {
+	raw := "```json\n" +
+		`{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"Agent","arguments":"{\"description\":\"only one\"}"}}]}}]}` +
+		"\n```"
+
+	result := ParseSimulatedResponse(raw, []string{"Agent"}, agentRequiredByTool())
+
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("expected the malformed tool call to be dropped, got %#v", result.ToolCalls)
+	}
+	if want := []string{"Agent"}; strings.Join(result.DroppedMissingArgs, ",") != strings.Join(want, ",") {
+		t.Fatalf("DroppedMissingArgs = %v, want %v", result.DroppedMissingArgs, want)
+	}
+}
+
+func TestBuildRepairNoteNamesToolsAndRequiredFields(t *testing.T) {
+	note := BuildRepairNote([]string{"Agent", "Agent", ""}, agentRequiredByTool())
+
+	for _, want := range []string{"RETRY", "Agent", "description", "prompt"} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("repair note missing %q: %s", want, note)
+		}
+	}
+}

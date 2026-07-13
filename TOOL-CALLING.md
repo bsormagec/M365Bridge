@@ -336,6 +336,14 @@ Both parsers receive names extracted from the effective tool list through `toolN
 
 A port must use the same provider-neutral normalization for preparation and allowlisting. Applying an OpenAI-only extractor to Anthropic definitions produces an empty allowlist and disables name filtering. Apply the allowlist after parsing and before execution or response emission. Prompt instructions alone are not a security boundary.
 
+### Required-argument validation and corrective re-ask
+
+The backend can emit a structurally valid tool call that omits schema-required fields (for example an `Agent`/`Task` call with an empty `description` or `prompt`). Forwarding such a call makes agent clients reject it and retry forever. Two layers guard against this.
+
+First, prevention: `RequiredArgsByTool` at `pkg/toolcalling/simulated.go::152` reads each tool's `input_schema.required` (Anthropic) or `function.parameters.required` (OpenAI), and the simulated prompts instruct the model to populate every required field with a concrete non-empty value. `toolCallSatisfiesRequired` then drops any call whose required arguments are missing, null, or empty strings, recording the offending tool name in `SimulatedResult.DroppedMissingArgs`.
+
+Second, correction: when a parse drops every tool call for missing required arguments and yields no usable call, `repairSimulatedToolCalls` at `pkg/servers/api.go` re-sends the request once with an appended corrective note (`BuildRepairNote`) naming the offending tools and their required fields, then re-parses. A recovered call replaces the empty turn; if the retry still fails, the original response is returned instead of looping. This corrective re-ask is wired into every simulated tool endpoint: OpenAI Chat Completions and Completions (streaming and non-streaming), Anthropic Messages (streaming and non-streaming), the coding-tool `runToolLoop`, and the OpenAI Responses empty-retry path.
+
 ### Plain-text fallback and finish reasons
 
 If a valid provider-shaped payload contains no accepted calls, its content is returned and the finish reason becomes `stop` or Anthropic `end_turn`.

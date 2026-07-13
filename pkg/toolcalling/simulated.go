@@ -41,6 +41,7 @@ func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice string) 
 			`If returning tool calls, use choices[0].message.tool_calls and set choices[0].finish_reason to "tool_calls".`,
 			"Do not refuse by saying tool invocation is unsupported.",
 			"For each tool call, function.arguments must be a JSON string value (not an object).",
+			"Every tool call MUST include all properties listed in that tool's parameters.required array, each with a concrete non-empty value inferred from the request; never emit a tool call with a missing or empty required field.",
 			"CRITICAL: Only use tool names that appear in the tools array of the request payload. Never invent tool names.",
 			"NEVER emit a tool_calls entry with name \"code_interpreter\" or any name not present in the request's tools array.",
 			"Do not use code_interpreter, web_search, or any built-in/baked-in tool. Only the client-supplied tools are valid.",
@@ -84,6 +85,7 @@ func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice
 			`For tool calls, choices[0].message.content must not be null; keep it concise and do not expose hidden reasoning or transport details.`,
 			`If returning plain text, use choices[0].message.content and set choices[0].finish_reason to "stop".`,
 			"For each tool call, function.arguments must be a JSON string value (not an object).",
+			"Every tool call MUST include all properties listed in that tool's parameters.required array, each with a concrete non-empty value inferred from the request; never emit a tool call with a missing or empty required field.",
 			`For a function inside a "type": "namespace" tool, keep the short function name and copy the enclosing namespace name into the tool call's "namespace" field.`,
 			"CRITICAL: Only use tool names that appear in the tools array or in a prior tool_search_output item. Never invent tool names.",
 			`A tool entry with "type": "tool_search" is callable as "tool_search" and can load additional tools when needed.`,
@@ -129,6 +131,7 @@ func BuildSimulatedPromptAnthropic(requestJSON string, hasTools bool, toolChoice
 			`If returning tool calls, use content blocks with "type": "tool_use" and set stop_reason to "tool_use".`,
 			"Do not refuse by saying tool invocation is unsupported.",
 			`For each tool_use block, "input" must be a JSON object (not a string).`,
+			"Every tool_use block MUST include all properties listed in that tool's input_schema.required array, each with a concrete non-empty value inferred from the request; never emit a tool_use block with a missing or empty required field.",
 			"CRITICAL: Only use tool names that appear in the tools array of the request payload. Never invent tool names.",
 			"NEVER emit a tool_use block with name \"code_interpreter\" or any name not present in the request's tools array.",
 			"Do not use code_interpreter, web_search, or any built-in/baked-in tool. Only the client-supplied tools are valid.",
@@ -184,6 +187,34 @@ func requiredFromSchema(schema map[string]any) []string {
 	return required
 }
 
+// BuildRepairNote constructs a corrective instruction appended to the simulated
+// request when the first attempt produced tool calls that omitted schema-required
+// arguments. It names each offending tool and the exact fields that must be
+// populated so the backend re-emits an executable tool call on the next attempt.
+func BuildRepairNote(droppedTools []string, requiredByTool map[string][]string) string {
+	seen := make(map[string]bool, len(droppedTools))
+	var clauses []string
+	for _, name := range droppedTools {
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		if required := requiredByTool[name]; len(required) > 0 {
+			clauses = append(clauses, fmt.Sprintf("%q (required: %s)", name, strings.Join(required, ", ")))
+		} else {
+			clauses = append(clauses, fmt.Sprintf("%q", name))
+		}
+	}
+	target := "the tool call"
+	if len(clauses) > 0 {
+		target = strings.Join(clauses, "; ")
+	}
+	return "RETRY: Your previous tool call was rejected because required arguments were missing or empty. " +
+		"Re-emit the JSON envelope with a tool call for " + target + ". " +
+		"Every required field MUST be present and filled with a concrete, non-empty value inferred from the request. " +
+		"Do not omit any required field and do not leave any required field as an empty string or null."
+}
+
 // toolCallSatisfiesRequired reports whether the tool call arguments contain
 // every required key with a non-empty value. A malformed arguments object, a
 // missing key, or an empty string/null value fails validation. This guards
@@ -215,6 +246,10 @@ type SimulatedResult struct {
 	ToolCalls    []ToolCall // parsed tool calls
 	FinishReason string     // "tool_calls" or "stop"
 	HasPayload   bool       // true if a usable chat-completion payload was found
+	// DroppedMissingArgs lists the names of tool calls that were dropped because
+	// they omitted schema-required arguments. Callers use this signal to trigger
+	// a single corrective re-ask instead of returning an empty turn.
+	DroppedMissingArgs []string
 }
 
 // ParseSimulatedResponse extracts a simulated OpenAI chat completion response
@@ -376,6 +411,7 @@ func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allo
 			// client never receives an unexecutable tool call to retry forever.
 			if !toolCallSatisfiesRequired(json.RawMessage(argsBytes), requiredByTool[name]) {
 				logging.Warnf("parseAnthropicPayload: dropping %q tool_use missing required arguments", name)
+				result.DroppedMissingArgs = append(result.DroppedMissingArgs, name)
 				continue
 			}
 			result.ToolCalls = append(result.ToolCalls, ToolCall{
@@ -491,6 +527,7 @@ func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult,
 			// retry in an endless loop).
 			if !toolCallSatisfiesRequired(json.RawMessage(args), requiredByTool[name]) {
 				logging.Warnf("parseChatCompletionPayload: dropping %q tool call missing required arguments", name)
+				result.DroppedMissingArgs = append(result.DroppedMissingArgs, name)
 				continue
 			}
 			result.ToolCalls = append(result.ToolCalls, ToolCall{

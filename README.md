@@ -641,6 +641,7 @@ Response:
 ### Notes
 
 - Tool calling is always enabled — no configuration needed. Requests without `tools` are unaffected.
+- Tool calls that omit schema-required arguments are dropped, and the proxy performs a single corrective re-ask so agent clients never receive an unexecutable call. This works best for single-step tool calls; sustained multi-round agent loops (for example Claude Code's `/init` or sub-agent tasks) depend on the M365 backend model's own tool-use reliability and are not guaranteed.
 - When M365 Copilot runs its own server-side tools (web search, code interpreter) and returns plain text instead of a simulated JSON payload, the response is returned as a normal text completion with `finish_reason: "stop"`.
 - `tool_result` messages (OpenAI) and `tool_use`/`tool_result` content blocks (Anthropic) in conversation history are converted to plain text before being sent to M365, since the M365 backend does not understand tool roles.
 - Streaming endpoints buffer the full response before parsing tool calls (tool call JSON may span multiple chunks).

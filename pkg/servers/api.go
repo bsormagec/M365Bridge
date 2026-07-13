@@ -636,6 +636,7 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 		} else {
 			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		}
+		simulated = api.repairSimulatedToolCalls(provider, messages, cfg, tools, simulated)
 		if !simulated.HasPayload || len(simulated.ToolCalls) == 0 {
 			if simulated.HasPayload {
 				text, finishReason = simulated.Content, "stop"
@@ -687,6 +688,46 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 			injectSimulatedPrompt(&messages, string(requestJSON), "auto")
 		}
 	}
+}
+
+// repairSimulatedToolCalls performs a single corrective re-ask when the initial
+// simulated parse dropped every tool call for missing required arguments. The
+// request envelope already lives in the last message, so the retry re-sends it
+// with an appended corrective note on a fresh conversation and re-parses. It
+// returns the recovered result when the backend supplies valid tool calls, and
+// the original result otherwise so callers keep their existing fallback path.
+func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, sim toolcalling.SimulatedResult) toolcalling.SimulatedResult {
+	if len(sim.ToolCalls) > 0 || len(sim.DroppedMissingArgs) == 0 || len(messages) == 0 {
+		return sim
+	}
+
+	requiredByTool := toolcalling.RequiredArgsByTool(tools)
+	note := toolcalling.BuildRepairNote(sim.DroppedMissingArgs, requiredByTool)
+	retry := make([]payload.Message, len(messages))
+	copy(retry, messages)
+	last := retry[len(retry)-1]
+	last.Content = last.Content + "\n\n" + note
+	retry[len(retry)-1] = last
+
+	logging.Warnf("repairSimulatedToolCalls: re-asking backend for tools missing required args: %v", sim.DroppedMissingArgs)
+	text, _, _, _, _, err := api.m365Client.ChatConversation(retry, cfg.Tone, cfg.Override, "", api.config.UserOID, api.config.TenantID, true)
+	if err != nil {
+		logging.Errorf("repairSimulatedToolCalls: retry failed: %v", err)
+		return sim
+	}
+
+	var retried toolcalling.SimulatedResult
+	if provider == toolLoopAnthropic {
+		retried = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), requiredByTool)
+	} else {
+		retried = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), requiredByTool)
+	}
+	if len(retried.ToolCalls) > 0 {
+		logging.Infof("repairSimulatedToolCalls: recovered %d tool call(s) after re-ask", len(retried.ToolCalls))
+		return retried
+	}
+	logging.Warn("repairSimulatedToolCalls: re-ask did not yield valid tool calls; keeping original response")
+	return sim
 }
 
 // handleChatCompletions handles OpenAI chat completion requests.
@@ -1330,6 +1371,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
 		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -1511,6 +1553,7 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
 		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -1744,6 +1787,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
 		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -1940,6 +1984,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 	// Parse simulated tool calls from response text
 	if hasTools {
 		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2120,6 +2165,7 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
 		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -2202,6 +2248,7 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 	// Parse simulated tool calls from response text
 	if hasTools {
 		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
+		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, sim)
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2940,6 +2987,7 @@ func responsesSimulationRetryMessages(
 			strings.Join(policy.allowedToolNames, ", "),
 		)
 	}
+	retryInstruction += " Every tool call MUST include all of its schema-required fields, each with a concrete non-empty value; a tool call with a missing or empty required field is invalid."
 
 	retried := append([]payload.Message(nil), messages...)
 	for index := len(retried) - 1; index >= 0; index-- {
