@@ -351,6 +351,11 @@ func ParseSimulatedResponseAnthropic(text string, allowedToolNames []string, req
 
 	result.HasPayload = true
 	parseAnthropicPayload(best, &result, allowed, requiredByTool)
+	if len(result.ToolCalls) > 0 {
+		logging.Infof("ParseSimulatedResponseAnthropic: parsed %d tool calls", len(result.ToolCalls))
+	} else if result.Content != "" {
+		logging.Debug("ParseSimulatedResponseAnthropic: parsed plain content response")
+	}
 	return result
 }
 
