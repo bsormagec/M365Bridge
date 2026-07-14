@@ -111,6 +111,19 @@ func (cc *ContextCache) evict() {
 	}
 }
 
+
+// Delete removes a conversation ID from memory and disk.
+func (cc *ContextCache) Delete(key string) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	delete(cc.mem, key)
+	if idx := indexOf(cc.order, key); idx >= 0 {
+		cc.order = append(cc.order[:idx], cc.order[idx+1:]...)
+	}
+	_ = os.Remove(cc.path(key))
+}
+
+
 // indexOf returns the index of a string in a slice, or -1.
 func indexOf(slice []string, s string) int {
 	for i, v := range slice {
@@ -918,6 +931,9 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
+			if sid != "" {
+				api.ctxCache.Delete("session:" + sid)
+			}
 			api.sendSSEError(w, chunkID, openaiModel, chunk.Error)
 			return
 		}
@@ -1083,6 +1099,9 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
 	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
+		if sid != "" {
+			api.ctxCache.Delete("session:" + sid)
+		}
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
 	}
@@ -1240,6 +1259,9 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
+			if sid != "" {
+				api.ctxCache.Delete("session:" + sid)
+			}
 			errEvent := map[string]interface{}{
 				"type": "error",
 				"error": map[string]interface{}{
@@ -1444,6 +1466,9 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef) {
 	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
+		if sid != "" {
+			api.ctxCache.Delete("session:" + sid)
+		}
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
 	}
@@ -1977,7 +2002,8 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice 
 	prompt := toolcalling.BuildSimulatedPrompt(requestJSON, true, toolChoice)
 	for i := len(*messages) - 1; i >= 0; i-- {
 		if (*messages)[i].Role == "user" {
-			(*messages)[i].Content = prompt
+			originalContent := (*messages)[i].Content
+			(*messages)[i].Content = prompt + "\nCURRENT USER MESSAGE\n" + originalContent
 			break
 		}
 	}
@@ -2007,7 +2033,8 @@ func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, to
 	prompt := toolcalling.BuildSimulatedPromptAnthropic(requestJSON, true, toolChoice)
 	for i := len(*messages) - 1; i >= 0; i-- {
 		if (*messages)[i].Role == "user" {
-			(*messages)[i].Content = prompt
+			originalContent := (*messages)[i].Content
+			(*messages)[i].Content = prompt + "\nCURRENT USER MESSAGE\n" + originalContent
 			break
 		}
 	}
@@ -2234,6 +2261,9 @@ func toolNamesFromDefs(tools []toolcalling.ToolDef) []string {
 	for _, t := range tools {
 		if t.Function.Name != "" {
 			names = append(names, t.Function.Name)
+		} else if t.Name != "" {
+			// Anthropic-style tool: name is at the top level.
+			names = append(names, t.Name)
 		}
 	}
 	return names
@@ -2445,9 +2475,10 @@ func responsesInputToMessages(input interface{}) []payload.Message {
 			callID, _ := m["call_id"].(string)
 			output, _ := m["output"].(string)
 			messages = append(messages, payload.Message{
-				Role:    "tool",
-				Content: output,
-				Name:    callID,
+				Role:       "tool",
+				Content:    fmt.Sprintf("call_id: %s\n%s", callID, output),
+				Name:       callID,
+				ToolCallID: callID,
 			})
 			continue
 		}
@@ -3150,7 +3181,7 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 		sid = r.Header.Get("X-Session-Id")
 	}
 	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, messages)
+		sid = "img-" + uuid.New().String()[:8]
 	}
 
 	var convID string
@@ -3828,4 +3859,52 @@ func extFromMediaType(mediaType string) string {
 	default:
 		return "png"
 	}
+}
+
+
+// sessionIDForMessages returns an explicit session ID from the request headers.
+// It returns the X-Session-Id header value when present, and an empty string
+// otherwise. Implicit (hash-derived) session IDs are intentionally not
+// returned here; callers that want a fallback should use getSessionID instead.
+func (api *APIServer) sessionIDForMessages(r *http.Request, _ []payload.Message) string {
+	return r.Header.Get("X-Session-Id")
+}
+
+// sessionIDForRequest resolves a session ID from explicit sources only.
+// Priority: body session_id > body user field > X-Session-Id header.
+// Returns an empty string when none of the explicit sources are set.
+func (api *APIServer) sessionIDForRequest(r *http.Request, sessionID, userID string, messages []payload.Message) string {
+	if sessionID != "" {
+		return sessionID
+	}
+	if userID != "" {
+		return userID
+	}
+	return api.sessionIDForMessages(r, messages)
+}
+func (api *APIServer) updateChatStreamSession(sid, finalConvID, fullText, thinkingText string, toolCalls []client.ToolCall) {
+	if sid == "" {
+		return
+	}
+
+	if strings.TrimSpace(fullText) == "" &&
+		strings.TrimSpace(thinkingText) == "" &&
+		len(toolCalls) == 0 {
+		api.ctxCache.Delete("session:" + sid)
+		return
+	}
+
+	if finalConvID != "" {
+		api.ctxCache.Set("session:"+sid, finalConvID)
+	}
+}
+// chatAnthropicThinkingForOutput strips the simulated transport envelope from a
+// complete thinking string for non-streaming and OpenAI callers. It delegates
+// to toolcalling.FilterTransportThinking so every endpoint (streaming and
+// non-streaming) applies the exact same filter.
+func chatAnthropicThinkingForOutput(thinking string, simulated bool) string {
+	if !simulated || thinking == "" {
+		return thinking
+	}
+	return toolcalling.FilterTransportThinking(thinking)
 }
