@@ -237,7 +237,7 @@ func (tm *TokenManager) M365CookieHeader() (string, error) {
 	var cookieParts []string
 	for _, cookie := range store.Cookies {
 		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
-		if domain != "m365.cloud.microsoft" && domain != "microsoft.com" {
+		if domain != "m365.cloud.microsoft" {
 			continue
 		}
 		if cookie.Name == "" || cookie.Value == "" {
@@ -426,6 +426,10 @@ func extractMetaRefreshURL(html string) string {
 }
 
 func summarizeBrokerAuthorizeResponse(body string) string {
+	if strings.Contains(strings.ToLower(body), "javascript is required") {
+		return "sign-in page requires JavaScript; re-run setup-wizard --browser to capture cookies in a real browser"
+	}
+
 	const aadSTSMarker = "AADSTS"
 	if start := strings.Index(body, aadSTSMarker); start >= 0 {
 		details := body[start:]
