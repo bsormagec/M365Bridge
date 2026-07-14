@@ -1289,6 +1289,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	hasContent := false
 	fullText := ""
 	var thinkingText strings.Builder
+	var thinkingFilter toolcalling.ThinkingStreamFilter
 	truncated := false
 
 	// When tool calling is enabled AND tools are present, buffer all text and
@@ -1318,6 +1319,17 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 		if chunk.Thinking != "" {
 			thinkingText.WriteString(chunk.Thinking)
 			if toolCallingEnabled {
+				// Live-stream filtered thinking so the transport envelope never
+				// leaks, matching the Anthropic streaming path.
+				if emit := thinkingFilter.Feed(chunk.Thinking); emit != "" {
+					payload := map[string]any{"reasoning_content": emit}
+					if !hasContent {
+						payload["role"] = "assistant"
+						hasContent = true
+					}
+					api.sendSSEChunk(w, chunkID, openaiModel, payload)
+					flusher.Flush()
+				}
 				continue
 			}
 			if !hasContent {
@@ -1379,19 +1391,13 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	}
 
 	if toolCallingEnabled {
-		thinkingOutput := chatAnthropicThinkingForOutput(thinkingText.String(), true)
-		if thinkingOutput != "" {
+		if rem := thinkingFilter.Flush(); rem != "" {
+			payload := map[string]any{"reasoning_content": rem}
 			if !hasContent {
-				api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
-					"role":              "assistant",
-					"reasoning_content": thinkingOutput,
-				})
+				payload["role"] = "assistant"
 				hasContent = true
-			} else {
-				api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
-					"reasoning_content": thinkingOutput,
-				})
 			}
+			api.sendSSEChunk(w, chunkID, openaiModel, payload)
 			flusher.Flush()
 		}
 	}
@@ -4201,6 +4207,43 @@ func (api *APIServer) streamResponses(
 		})
 	}
 
+	// Reasoning is streamed live; under simulated tool calling it passes through
+	// thinkingFilter first so the transport envelope never leaks. reasoningEmitted
+	// accumulates exactly what was published for the terminal done events.
+	var thinkingFilter toolcalling.ThinkingStreamFilter
+	var reasoningEmitted strings.Builder
+	reasoningFlushed := false
+	emitReasoning := func(delta string) {
+		if delta == "" {
+			return
+		}
+		reasoningEmitted.WriteString(delta)
+		if !reasoningItemEmitted {
+			sendEvent("response.output_item.added", map[string]any{
+				"output_index": 0,
+				"item": map[string]any{
+					"id":      reasoningID,
+					"type":    "reasoning",
+					"status":  "in_progress",
+					"summary": []map[string]any{{"type": "summary_text", "text": ""}},
+				},
+			})
+			sendEvent("response.reasoning_summary_part.added", map[string]any{
+				"item_id":       reasoningID,
+				"output_index":  0,
+				"summary_index": 0,
+				"part":          map[string]any{"type": "summary_text", "text": ""},
+			})
+			reasoningItemEmitted = true
+		}
+		sendEvent("response.reasoning_summary_text.delta", map[string]any{
+			"item_id":       reasoningID,
+			"output_index":  0,
+			"summary_index": 0,
+			"delta":         delta,
+		})
+	}
+
 	var finalConvID string
 	for chunk := range ch {
 		if chunk.Error != nil {
@@ -4216,48 +4259,26 @@ func (api *APIServer) streamResponses(
 			break
 		}
 
-		// Simulated tool prompts contain transport JSON in M365 thinking
-		// summaries. Never expose that content as Responses reasoning.
-		if chunk.Thinking != "" && !toolCallingEnabled {
+		// Stream reasoning live. Under simulated tool calling it is filtered so
+		// the transport envelope never leaks; otherwise it passes through raw.
+		if chunk.Thinking != "" {
 			thinkingText.WriteString(chunk.Thinking)
-
-			if !reasoningItemEmitted {
-				sendEvent("response.output_item.added", map[string]any{
-					"output_index": 0,
-					"item": map[string]any{
-						"id":     reasoningID,
-						"type":   "reasoning",
-						"status": "in_progress",
-						"summary": []map[string]any{
-							{
-								"type": "summary_text",
-								"text": "",
-							},
-						},
-					},
-				})
-				sendEvent("response.reasoning_summary_part.added", map[string]any{
-					"item_id":       reasoningID,
-					"output_index":  0,
-					"summary_index": 0,
-					"part": map[string]any{
-						"type": "summary_text",
-						"text": "",
-					},
-				})
-				reasoningItemEmitted = true
+			if toolCallingEnabled {
+				emitReasoning(thinkingFilter.Feed(chunk.Thinking))
+			} else {
+				emitReasoning(chunk.Thinking)
 			}
-			sendEvent("response.reasoning_summary_text.delta", map[string]any{
-				"item_id":       reasoningID,
-				"output_index":  0,
-				"summary_index": 0,
-				"delta":         chunk.Thinking,
-			})
 		}
 
 		// Handle text content
 		if chunk.Text != "" {
 			if toolCallingEnabled {
+				// Flush remaining reasoning before content so the reasoning item
+				// is fully emitted at output_index 0 ahead of the message item.
+				if !reasoningFlushed {
+					emitReasoning(thinkingFilter.Flush())
+					reasoningFlushed = true
+				}
 				// Keep the raw transport for final tool-call parsing, while
 				// publishing only decoded assistant content.
 				fullText += chunk.Text
@@ -4350,13 +4371,22 @@ func (api *APIServer) streamResponses(
 		return
 	}
 
-	// Finalize reasoning item if emitted
-	if reasoningItemEmitted && !toolCallingEnabled {
+	// Flush any remaining filtered reasoning for the thinking-only case where no
+	// content chunk triggered the in-loop flush.
+	if toolCallingEnabled && !reasoningFlushed {
+		emitReasoning(thinkingFilter.Flush())
+		reasoningFlushed = true
+	}
+
+	// Finalize reasoning item if emitted. reasoningEmitted holds exactly what was
+	// published (raw for non-simulated, filtered under simulated tool calling).
+	if reasoningItemEmitted {
+		reasoningFinal := reasoningEmitted.String()
 		sendEvent("response.reasoning_summary_text.done", map[string]any{
 			"item_id":       reasoningID,
 			"output_index":  0,
 			"summary_index": 0,
-			"text":          thinkingText.String(),
+			"text":          reasoningFinal,
 		})
 		sendEvent("response.reasoning_summary_part.done", map[string]any{
 			"item_id":       reasoningID,
@@ -4364,7 +4394,7 @@ func (api *APIServer) streamResponses(
 			"summary_index": 0,
 			"part": map[string]any{
 				"type": "summary_text",
-				"text": thinkingText.String(),
+				"text": reasoningFinal,
 			},
 		})
 		sendEvent("response.output_item.done", map[string]any{
@@ -4376,7 +4406,7 @@ func (api *APIServer) streamResponses(
 				"summary": []map[string]any{
 					{
 						"type": "summary_text",
-						"text": thinkingText.String(),
+						"text": reasoningFinal,
 					},
 				},
 			},
