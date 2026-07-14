@@ -812,9 +812,7 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Upload any images found in multimodal content and attach annotations
-	if uploadedConvID := api.uploadImagesAndAnnotate(&req.Messages, convID); uploadedConvID != "" && convID == "" {
-		convID = uploadedConvID
-	}
+	api.uploadImagesAndAnnotate(&req.Messages, convID)
 
 	// Determine if client-defined tools are present (for optionsSets stripping)
 	hasTools := len(req.Tools) > 0
@@ -1047,9 +1045,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 
 	// Upload any images found in multimodal content and attach annotations
-	if uploadedConvID := api.uploadImagesAndAnnotate(&chatMessages, convID); uploadedConvID != "" && convID == "" {
-		convID = uploadedConvID
-	}
+	api.uploadImagesAndAnnotate(&chatMessages, convID)
 
 	// Determine if client-defined tools are present (for optionsSets stripping)
 	hasTools := len(req.Tools) > 0
@@ -2027,12 +2023,15 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 		return
 	}
 
-	// In simulated mode, discard backend-injected tool calls
+	// In simulated mode, discard backend-injected tool calls (e.g.
+	// code_interpreter) — only client-declared tools parsed from the
+	// simulated JSON response are valid.
 	if hasTools {
 		toolCalls = nil
+		thinking = chatAnthropicThinkingForOutput(thinking, true)
 	}
 
-	// Parse simulated tool calls from response text
+	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
 		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools), toolcalling.RequiredArgsByTool(tools))
 		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, sim)
@@ -2052,6 +2051,10 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 				finishReason = "stop"
 			}
 		} else {
+			// M365 did not return a simulated JSON payload (e.g. it ran
+			// its own server-side tools and returned plain text). Since
+			// we discarded backend-injected toolCalls above, reset the
+			// finish reason so we don't report tool_use with no blocks.
 			finishReason = "stop"
 		}
 	}
@@ -2482,17 +2485,17 @@ func (api *APIServer) sendAnthropicSSE(w http.ResponseWriter, eventType string, 
 // uploadImagesAndAnnotate uploads any images found in message Images fields
 // to the M365 backend and attaches the resulting docId annotations to the
 // last message with images. This enables multimodal image input support.
-func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convID string) string {
+func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convID string) {
 	// Find the last message with images
 	lastImgIdx := -1
-	for i := len(*messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(*messages) {
 		if len((*messages)[i].Images) > 0 {
 			lastImgIdx = i
 			break
 		}
 	}
 	if lastImgIdx < 0 {
-		return ""
+		return
 	}
 
 	logging.Infof("uploadImagesAndAnnotate: uploading %d images for message[%d] convID=%s", len((*messages)[lastImgIdx].Images), lastImgIdx, convID)
@@ -2527,7 +2530,6 @@ func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convI
 			},
 		})
 	}
-	return uploadConvID
 }
 
 // injectJSONMode injects JSON mode instructions into messages.
@@ -2544,30 +2546,15 @@ func (api *APIServer) injectJSONMode(messages *[]payload.Message) {
 	*messages = append([]payload.Message{{Role: "system", Content: instruction}}, *messages...)
 }
 
-var chatAnthropicSimulationMetaPattern = regexp.MustCompile(
-	`(?i)(generat\w*\s+(a\s+|the\s+)?json|chatcmpl-|chat\.completion|simulat\w+\s+(an?\s+)?(openai|anthropic)?\s*response|json\s+(code\s+)?block|"?tool_calls"?|"?finish_reason"?)`,
-)
-
+// chatAnthropicThinkingForOutput strips the simulated transport envelope from a
+// complete thinking string for non-streaming and OpenAI callers. It delegates
+// to toolcalling.FilterTransportThinking so every endpoint (streaming and
+// non-streaming) applies the exact same filter.
 func chatAnthropicThinkingForOutput(thinking string, simulated bool) string {
 	if !simulated || thinking == "" {
 		return thinking
 	}
-
-	var output []string
-	inFence := false
-	for _, line := range strings.Split(thinking, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
-			continue
-		}
-		if inFence || chatAnthropicSimulationMetaPattern.MatchString(line) {
-			continue
-		}
-		output = append(output, line)
-	}
-
-	return strings.TrimSpace(strings.Join(output, "\n"))
+	return toolcalling.FilterTransportThinking(thinking)
 }
 
 // injectSimulatedPrompt replaces the last user message with a simulated-mode
@@ -2578,7 +2565,7 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice 
 		return
 	}
 	prompt := toolcalling.BuildSimulatedPrompt(requestJSON, true, toolChoice)
-	for i := len(*messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(*messages) {
 		if (*messages)[i].Role == "user" {
 			suffix := ""
 			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
@@ -2612,7 +2599,7 @@ func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, to
 		return
 	}
 	prompt := toolcalling.BuildSimulatedPromptAnthropic(requestJSON, true, toolChoice)
-	for i := len(*messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(*messages) {
 		if (*messages)[i].Role == "user" {
 			suffix := ""
 			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
@@ -3041,7 +3028,7 @@ func responsesSimulationRetryMessages(
 	retryInstruction += " Every tool call MUST include all of its schema-required fields, each with a concrete non-empty value; a tool call with a missing or empty required field is invalid."
 
 	retried := append([]payload.Message(nil), messages...)
-	for index := len(retried) - 1; index >= 0; index-- {
+	for index := range slices.Backward(retried) {
 		if retried[index].Role == "user" {
 			retried[index].Content += "\n\n" + retryInstruction
 			return retried
@@ -4770,7 +4757,7 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Parse model (may contain session ID suffix: "gpt5.5:my-session")
+	// Parse model (may contain session ID suffix)
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
 	cfg := models.LookupModel(modelKey)
 	if cfg.OpenAIID == "" {
@@ -5469,22 +5456,4 @@ func extFromMediaType(mediaType string) string {
 	default:
 		return "png"
 	}
-}
-// sessionIDForMessages returns an explicit session identity sourced from the
-// request header only. It never infers a session from message content so that
-// single-turn conversations do not accidentally create persistent sessions.
-func (api *APIServer) sessionIDForMessages(r *http.Request, messages []payload.Message) string {
-	return r.Header.Get("X-Session-Id")
-}
-
-// sessionIDForRequest resolves the session identity for a request using a
-// fixed priority: explicit body session > body user field > X-Session-Id header.
-func (api *APIServer) sessionIDForRequest(r *http.Request, bodySession, bodyUser string, messages []payload.Message) string {
-	if bodySession != "" {
-		return bodySession
-	}
-	if bodyUser != "" {
-		return bodyUser
-	}
-	return api.sessionIDForMessages(r, messages)
 }

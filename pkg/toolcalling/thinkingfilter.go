@@ -37,6 +37,20 @@ func (f *ThinkingStreamFilter) Feed(chunk string) string {
 	return out.String()
 }
 
+// FilterTransportThinking strips the simulated transport envelope (fenced
+// blocks and transport meta lines) from a complete thinking string using the
+// same rules as ThinkingStreamFilter. It is the batch entry point for
+// non-streaming callers; streaming callers use ThinkingStreamFilter directly so
+// every endpoint applies one consistent filter.
+func FilterTransportThinking(thinking string) string {
+	if thinking == "" {
+		return ""
+	}
+	var f ThinkingStreamFilter
+	out := f.Feed(thinking) + f.Flush()
+	return strings.TrimRight(out, "\n")
+}
+
 // Flush returns the cleaned remainder held after the last newline, if kept.
 func (f *ThinkingStreamFilter) Flush() string {
 	line := f.pending.String()
@@ -85,7 +99,7 @@ var transportThinkingMarkers = []string{
 	"envelope", "payload", "tool_use", "tool_call", "tool call",
 	"stop_reason", "finish_reason", "simulat",
 	"anthropic format", "anthropic messages", "anthropic response",
-	"openai format", "chat.completion", "chat completion",
+	"openai format", "chat.completion", "chat completion", "chatcmpl",
 	"response object", "response format", "required format", "exact format",
 	"same format", "code block", "assistant response", "assistant message",
 	"content array", "content block",
