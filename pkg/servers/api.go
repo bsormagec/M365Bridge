@@ -771,7 +771,9 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Upload any images found in multimodal content and attach annotations
-	api.uploadImagesAndAnnotate(&req.Messages, convID)
+	if uploadedConvID := api.uploadImagesAndAnnotate(&req.Messages, convID); uploadedConvID != "" && convID == "" {
+		convID = uploadedConvID
+	}
 
 	// Determine if client-defined tools are present (for optionsSets stripping)
 	hasTools := len(req.Tools) > 0
@@ -1004,7 +1006,9 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 
 	// Upload any images found in multimodal content and attach annotations
-	api.uploadImagesAndAnnotate(&chatMessages, convID)
+	if uploadedConvID := api.uploadImagesAndAnnotate(&chatMessages, convID); uploadedConvID != "" && convID == "" {
+		convID = uploadedConvID
+	}
 
 	// Determine if client-defined tools are present (for optionsSets stripping)
 	hasTools := len(req.Tools) > 0
@@ -2380,7 +2384,7 @@ func (api *APIServer) sendAnthropicSSE(w http.ResponseWriter, eventType string, 
 // uploadImagesAndAnnotate uploads any images found in message Images fields
 // to the M365 backend and attaches the resulting docId annotations to the
 // last message with images. This enables multimodal image input support.
-func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convID string) {
+func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convID string) string {
 	// Find the last message with images
 	lastImgIdx := -1
 	for i := len(*messages) - 1; i >= 0; i-- {
@@ -2390,7 +2394,7 @@ func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convI
 		}
 	}
 	if lastImgIdx < 0 {
-		return
+		return ""
 	}
 
 	logging.Infof("uploadImagesAndAnnotate: uploading %d images for message[%d] convID=%s", len((*messages)[lastImgIdx].Images), lastImgIdx, convID)
@@ -2425,6 +2429,7 @@ func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convI
 			},
 		})
 	}
+	return uploadConvID
 }
 
 // injectJSONMode injects JSON mode instructions into messages.
