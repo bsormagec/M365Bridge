@@ -633,6 +633,7 @@ Yanıt:
 ### Notlar
 
 - Tool calling her zaman etkindir — yapılandırma gerekmez. `tools` olmayan istekler etkilenmez.
+- Şema tarafından zorunlu kılınan argümanları eksik bırakan araç çağrıları düşürülür ve proxy tek seferlik düzeltici bir yeniden-sorma yapar; böylece agent istemcileri çalıştırılamaz bir çağrı almaz. Bu, tek adımlı araç çağrılarında en iyi sonucu verir; çok turlu sürekli agent döngüleri (örneğin Claude Code'un `/init` komutu veya alt-agent görevleri) M365 backend modelinin kendi araç kullanım güvenilirliğine bağlıdır ve garanti edilmez.
 - M365 Copilot kendi sunucu tarafı araçlarını çalıştırdığında (web araması, code interpreter) ve simüle JSON yerine düz metin döndürdüğünde, yanıt normal bir metin tamamlaması olarak `finish_reason: "stop"` ile döndürülür.
 - Konuşma geçmişindeki `tool_result` mesajları (OpenAI) ve `tool_use`/`tool_result` içerik blokları (Anthropic), M365 backend'i tool rollerini anlamadığı için M365'ye gönderilmeden önce düz metne dönüştürülür.
 - Streaming endpoint'leri, tool call'ları ayrıştırmadan önce tam yanıtı tampona alır (tool call JSON'u birden çok chunk'a yayılabilir).

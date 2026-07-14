@@ -145,7 +145,7 @@ func LoadConfig() *Config {
 func parseAPIKeys(keysCSV, singleKey string) []string {
 	if keysCSV != "" {
 		var keys []string
-		for _, k := range strings.Split(keysCSV, ",") {
+		for k := range strings.SplitSeq(keysCSV, ",") {
 			k = strings.TrimSpace(k)
 			if k != "" {
 				keys = append(keys, k)
@@ -171,7 +171,7 @@ func loadDotEnv() {
 		}
 	}
 
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

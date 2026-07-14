@@ -10,4 +10,4 @@ __pycache__/*
 # Docker
 docker-data/
 webui_analysis.md
-encryption.key
+encryption.keyadd_session_methods.py

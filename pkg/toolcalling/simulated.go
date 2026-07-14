@@ -63,9 +63,9 @@ func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice
 	lines := []string{
 		"The JSON payload below is an entire request for the OpenAI Responses API.",
 		"The JSON payload below is an entire request for POST /v1/responses.",
-		`Interpret "input" as the complete Responses conversation, including message, function_call, function_call_output, tool_search_call, and tool_search_output items.`,
+		`Interpret "input" as the complete Responses conversation, including message, function_call, and function_call_output items.`,
 		`Apply "instructions" to the entire request before deciding the answer or tool call.`,
-		`Treat "tools" plus tools listed in prior "tool_search_output" items as the complete callable set, and obey "tool_choice" exactly.`,
+		`Treat "tools" as the complete list of client-supplied functions and obey "tool_choice" exactly.`,
 		"Produce the result inside the chat-completion-shaped JSON envelope described below; this envelope is only an internal transport format.",
 		"Return exactly one markdown JSON code block containing a single valid JSON object and no surrounding prose.",
 		"Do not include protocol IDs such as chatcmpl-* and do not echo the request payload.",
@@ -76,14 +76,10 @@ func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice
 		lines = append(lines,
 			"Tool calls are supported here: emit assistant tool calls when appropriate.",
 			`If returning tool calls, use choices[0].message.tool_calls and set choices[0].finish_reason to "tool_calls".`,
-			`When returning tool calls, also put one brief user-facing progress update in choices[0].message.content describing the immediate action and why.`,
-			`For tool calls, choices[0].message.content must not be null; keep it concise and do not expose hidden reasoning or transport details.`,
 			`If returning plain text, use choices[0].message.content and set choices[0].finish_reason to "stop".`,
 			"For each tool call, function.arguments must be a JSON string value (not an object).",
-			`For a function inside a "type": "namespace" tool, keep the short function name and copy the enclosing namespace name into the tool call's "namespace" field.`,
-			"CRITICAL: Only use tool names that appear in the tools array or in a prior tool_search_output item. Never invent tool names.",
-			`A tool entry with "type": "tool_search" is callable as "tool_search" and can load additional tools when needed.`,
-			"Do not use code_interpreter, web_search, or another built-in tool unless its exact name is in the callable set.",
+			"CRITICAL: Only use tool names that appear in the tools array of the Responses request. Never invent tool names.",
+			"Do not use code_interpreter, web_search, or any built-in tool unless that exact name appears in the request's tools array.",
 		)
 
 		normalizedChoice := strings.TrimSpace(toolChoice)
@@ -159,16 +155,6 @@ type SimulatedResult struct {
 // is silently dropped. If all tool calls are dropped, the response is treated as
 // a plain content response. Pass nil to disable filtering (not recommended).
 func ParseSimulatedResponse(text string, allowedToolNames []string) SimulatedResult {
-	return parseSimulatedResponse(text, allowedToolNames, false)
-}
-
-// ParseSimulatedResponseResponses preserves assistant content alongside valid
-// tool calls so Responses clients can display a commentary preamble.
-func ParseSimulatedResponseResponses(text string, allowedToolNames []string) SimulatedResult {
-	return parseSimulatedResponse(text, allowedToolNames, true)
-}
-
-func parseSimulatedResponse(text string, allowedToolNames []string, preserveToolContent bool) SimulatedResult {
 	allowed := make(map[string]bool, len(allowedToolNames))
 	for _, n := range allowedToolNames {
 		allowed[strings.TrimSpace(n)] = true
@@ -201,7 +187,7 @@ func parseSimulatedResponse(text string, allowedToolNames []string, preserveTool
 	}
 
 	result.HasPayload = true
-	parseChatCompletionPayload(best, &result, allowed, preserveToolContent)
+	parseChatCompletionPayload(best, &result, allowed)
 	if len(result.ToolCalls) > 0 {
 		logging.Infof("ParseSimulatedResponse: parsed %d tool calls", len(result.ToolCalls))
 	} else if result.Content != "" {
@@ -317,9 +303,6 @@ func parseAnthropicPayload(payload map[string]interface{}, result *SimulatedResu
 		result.FinishReason = "tool_calls"
 		return
 	}
-	if result.FinishReason == "tool_calls" {
-		result.FinishReason = "stop"
-	}
 	result.Content = strings.Join(textParts, "\n")
 }
 
@@ -376,7 +359,7 @@ func scoreAnthropicCandidate(candidate map[string]interface{}) int {
 // chat.completion-shaped JSON object into the result. Tool calls whose name is
 // not in `allowed` (when non-empty) are dropped — this strips M365-invented
 // tools like "code_interpreter" that the client never declared.
-func parseChatCompletionPayload(payload map[string]interface{}, result *SimulatedResult, allowed map[string]bool, preserveToolContent bool) {
+func parseChatCompletionPayload(payload map[string]interface{}, result *SimulatedResult, allowed map[string]bool) {
 	choices, ok := payload["choices"].([]interface{})
 	if !ok || len(choices) == 0 {
 		return
@@ -401,7 +384,7 @@ func parseChatCompletionPayload(payload map[string]interface{}, result *Simulate
 			if !ok {
 				continue
 			}
-			name, namespace, id, args := extractToolCallFields(tc)
+			name, id, args := extractToolCallFields(tc)
 			if name == "" {
 				continue
 			}
@@ -414,21 +397,13 @@ func parseChatCompletionPayload(payload map[string]interface{}, result *Simulate
 			result.ToolCalls = append(result.ToolCalls, ToolCall{
 				ID:        id,
 				Name:      name,
-				Namespace: namespace,
 				Arguments: json.RawMessage(args),
 			})
 		}
 		if len(result.ToolCalls) > 0 {
-			if preserveToolContent {
-				result.Content = normalizeMessageContent(message["content"])
-			} else {
-				result.Content = ""
-			}
+			result.Content = ""
 			result.FinishReason = "tool_calls"
 			return
-		}
-		if result.FinishReason == "tool_calls" {
-			result.FinishReason = "stop"
 		}
 	}
 
@@ -438,13 +413,10 @@ func parseChatCompletionPayload(payload map[string]interface{}, result *Simulate
 // extractToolCallFields pulls id/name/arguments from a tool_calls entry,
 // tolerating both the OpenAI wrapper ({id,type,function:{name,arguments}})
 // and a flat shape ({name,arguments}).
-func extractToolCallFields(tc map[string]interface{}) (name, namespace, id, args string) {
+func extractToolCallFields(tc map[string]interface{}) (name, id, args string) {
 	if fn, ok := tc["function"].(map[string]interface{}); ok {
 		if n, ok := fn["name"].(string); ok && n != "" {
 			name = n
-		}
-		if ns, ok := fn["namespace"].(string); ok && ns != "" {
-			namespace = ns
 		}
 		args = normalizeArgumentsJSON(fn["arguments"])
 		if i, ok := tc["id"].(string); ok && i != "" {
@@ -454,11 +426,6 @@ func extractToolCallFields(tc map[string]interface{}) (name, namespace, id, args
 	if name == "" {
 		if n, ok := tc["name"].(string); ok && n != "" {
 			name = n
-		}
-	}
-	if namespace == "" {
-		if ns, ok := tc["namespace"].(string); ok && ns != "" {
-			namespace = ns
 		}
 	}
 	if args == "" {
