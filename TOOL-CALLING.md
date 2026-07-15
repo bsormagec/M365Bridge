@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document describes the complete tool-calling implementation in M365Bridge and turns it into a reusable design for other projects. It covers three separate mechanisms:
+This document describes a complete M365-backed tool-calling design and turns it into a reusable implementation guide for other projects. It covers three separate mechanisms:
 
 1. M365 backend tools, which execute inside Microsoft infrastructure.
 2. Caller-defined simulated tools, which are declared and executed by an API client.
@@ -10,29 +10,610 @@ This document describes the complete tool-calling implementation in M365Bridge a
 
 These mechanisms share response types but have different trust boundaries, execution owners, and lifecycle rules. They must not be treated as interchangeable.
 
-## Scope and source of truth
+## Scope and portability boundary
 
-The production implementation is distributed across these files:
+This document is intentionally self-contained. It describes contracts, algorithms, wire shapes, and security boundaries that can be implemented in another project without copying a particular repository layout. Names such as `ToolDef`, `ToolCall`, `BuildSimulatedPrompt`, and `runToolLoop` are descriptive implementation labels, not required package names.
 
-| Concern                                                | Source                                   |
-|--------------------------------------------------------|------------------------------------------|
-| Shared caller-defined tool types and text formatting   | `pkg/toolcalling/toolcalling.go::19`     |
-| OpenAI and Anthropic simulated prompts and parsers     | `pkg/toolcalling/simulated.go::21`       |
-| HTTP adaptation and local tool loop                    | `pkg/servers/api.go::542`                |
-| Provider streaming and non-streaming output            | `pkg/servers/api.go::1218`               |
-| M365 SignalR tool-event extraction                     | `pkg/client/client.go::295`              |
-| Message-history conversion                             | `pkg/payload/payload.go::115`            |
-| M365 option filtering                                  | `pkg/payload/payload.go::552`            |
-| Tool message-type mapping and local-tool configuration | `pkg/models/models.go::93`               |
-| Built-in tool schemas                                  | `pkg/codingtools/codingtools.go::77`     |
-| Built-in tool execution                                | `pkg/codingtools/codingtools.go::95`     |
-| Unix process-tree handling                             | `pkg/codingtools/process_unix.go::12`    |
-| Windows process-tree handling                          | `pkg/codingtools/process_windows.go::11` |
-| OpenAI integration checks                              | `test_toolcalling_openai.sh::1`          |
-| Anthropic integration checks                           | `test_toolcalling_anthropic.sh::1`       |
-| Runtime dependencies                                   | `Dockerfile::16`                         |
+A portable implementation should define these independent modules:
 
-The implementation, not this document, remains authoritative when behavior changes.
+| Module             | Responsibility                                                                                                                                |
+|--------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| Provider adapters  | Decode requests, normalize tool definitions, preserve provider semantics, and encode provider-native responses.                               |
+| Simulation engine  | Build provider-specific prompts, extract JSON candidates, score response shapes, validate calls, and perform corrective retries.              |
+| Upstream transport | Send the latest turn to the model backend, stream text and reasoning, collect backend activity, and return the final conversation identifier. |
+| History adapter    | Convert provider tool history into the upstream model's accepted text or message representation.                                              |
+| Local tool manager | Expose optional local schemas, enforce workspace and process policy, execute calls, and serialize results.                                    |
+| Conversation store | Map stable client sessions to upstream conversation identifiers.                                                                              |
+| Runtime isolation  | Provide authentication, least privilege, filesystem boundaries, network policy, and resource quotas.                                          |
+
+The M365-specific behavior described here is the reference behavior, while the provider contracts and parser order are the portable design. A port should preserve the documented invariants even when its backend, language, package structure, or runtime differs.
+
+## Copy-paste reference implementation
+
+The following Go sections form one dependency-free reference package. Copy every Go block in this section into one package, keep the first import block only, and compile it with the standard library. The package does not perform network access, execute local tools, or expose credentials. Those operations remain behind the explicit interfaces shown after the parser. Replace only the `Upstream` callback, provider HTTP adapters, and local executor implementation for the target project.
+
+### Core types, normalization, validation, and JSON parser
+
+```go
+package toolbridge
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "strings"
+)
+
+type ToolFunction struct {
+    Name        string
+    Description string
+    Parameters  map[string]any
+}
+
+type ToolDefinition struct {
+    Type        string
+    Namespace   string
+    Function    ToolFunction
+    Name        string
+    Description string
+    InputSchema map[string]any
+    Tools       []ToolDefinition
+    Parameters  map[string]any
+}
+
+type ToolCall struct {
+    ID        string
+    Name      string
+    Namespace string
+    Arguments json.RawMessage
+}
+
+type SimulationResult struct {
+    Content            string
+    ToolCalls          []ToolCall
+    FinishReason       string
+    HasPayload         bool
+    DroppedMissingArgs []string
+}
+
+func ToolName(tool ToolDefinition) string {
+    if tool.Function.Name != "" {
+        return tool.Function.Name
+    }
+    return tool.Name
+}
+
+func ToolKey(namespace, name string) string {
+    if namespace == "" {
+        return name
+    }
+    return namespace + "/" + name
+}
+
+func FlattenTools(input []ToolDefinition) map[string]ToolDefinition {
+    result := make(map[string]ToolDefinition)
+    var visit func([]ToolDefinition, string)
+    visit = func(tools []ToolDefinition, inheritedNamespace string) {
+        for _, tool := range tools {
+            namespace := tool.Namespace
+            if namespace == "" {
+                namespace = inheritedNamespace
+            }
+            if len(tool.Tools) > 0 {
+                visit(tool.Tools, namespace)
+                continue
+            }
+            name := ToolName(tool)
+            if name == "" {
+                continue
+            }
+            tool.Namespace = namespace
+            tool.Name = name
+            result[ToolKey(namespace, name)] = tool
+        }
+    }
+    visit(input, "")
+    return result
+}
+
+func RequiredArgs(tool ToolDefinition) []string {
+    schema := tool.InputSchema
+    if schema == nil {
+        schema = tool.Parameters
+    }
+    raw, ok := schema["required"]
+    if !ok {
+        return nil
+    }
+    switch values := raw.(type) {
+    case []string:
+        return append([]string(nil), values...)
+    case []any:
+        required := make([]string, 0, len(values))
+        for _, value := range values {
+            if name, ok := value.(string); ok && name != "" {
+                required = append(required, name)
+            }
+        }
+        return required
+    default:
+        return nil
+    }
+}
+
+func RequiredByTool(tools map[string]ToolDefinition) map[string][]string {
+    result := make(map[string][]string, len(tools))
+    for key, tool := range tools {
+        result[key] = RequiredArgs(tool)
+    }
+    return result
+}
+
+func normalizeArguments(value any) json.RawMessage {
+    if text, ok := value.(string); ok {
+        candidate := strings.TrimSpace(text)
+        if json.Valid([]byte(candidate)) {
+            return json.RawMessage(candidate)
+        }
+        return json.RawMessage(`{}`)
+    }
+    encoded, err := json.Marshal(value)
+    if err != nil || len(encoded) == 0 || string(encoded) == "null" {
+        return json.RawMessage(`{}`)
+    }
+    return encoded
+}
+
+func argumentObject(arguments json.RawMessage) (map[string]any, bool) {
+    var object map[string]any
+    if err := json.Unmarshal(arguments, &object); err != nil || object == nil {
+        return nil, false
+    }
+    return object, true
+}
+
+func satisfiesRequired(arguments json.RawMessage, required []string) bool {
+    if len(required) == 0 {
+        return true
+    }
+    object, ok := argumentObject(arguments)
+    if !ok {
+        return false
+    }
+    for _, name := range required {
+        value, exists := object[name]
+        if !exists || value == nil {
+            return false
+        }
+        if text, ok := value.(string); ok && strings.TrimSpace(text) == "" {
+            return false
+        }
+    }
+    return true
+}
+
+func resolveTool(name, namespace string, tools map[string]ToolDefinition) (string, ToolDefinition, bool) {
+    if exact, ok := tools[ToolKey(namespace, name)]; ok {
+        return ToolKey(namespace, name), exact, true
+    }
+    if namespace != "" {
+        return "", ToolDefinition{}, false
+    }
+    var matchKey string
+    var match ToolDefinition
+    matches := 0
+    for key, tool := range tools {
+        if ToolName(tool) == name {
+            matchKey = key
+            match = tool
+            matches++
+        }
+    }
+    if matches != 1 {
+        return "", ToolDefinition{}, false
+    }
+    return matchKey, match, true
+}
+
+func jsonCandidates(text string) [][]byte {
+    const maxCandidates = 128
+    seen := make(map[string]struct{})
+    result := make([][]byte, 0, 8)
+    add := func(candidate string) {
+        candidate = strings.TrimSpace(candidate)
+        if candidate == "" || len(result) >= maxCandidates || !json.Valid([]byte(candidate)) {
+            return
+        }
+        if _, exists := seen[candidate]; exists {
+            return
+        }
+        seen[candidate] = struct{}{}
+        result = append(result, []byte(candidate))
+    }
+
+    add(text)
+    lines := strings.Split(text, "\n")
+    inFence := false
+    var fenced strings.Builder
+    for _, line := range lines {
+        trimmed := strings.TrimSpace(line)
+        if strings.HasPrefix(trimmed, "```") {
+            if inFence {
+                add(fenced.String())
+                fenced.Reset()
+            }
+            inFence = !inFence
+            continue
+        }
+        if inFence {
+            fenced.WriteString(line)
+            fenced.WriteByte('\n')
+        }
+    }
+
+    for start := 0; start < len(text) && len(result) < maxCandidates; start++ {
+        if text[start] != '{' && text[start] != '[' {
+            continue
+        }
+        if end, ok := balancedEnd(text, start); ok {
+            add(text[start : end+1])
+            start = end
+        }
+    }
+    return result
+}
+
+func balancedEnd(text string, start int) (int, bool) {
+    stack := make([]byte, 0, 8)
+    quoted := false
+    escaped := false
+    for index := start; index < len(text); index++ {
+        char := text[index]
+        if quoted {
+            if escaped {
+                escaped = false
+            } else if char == '\\' {
+                escaped = true
+            } else if char == '"' {
+                quoted = false
+            }
+            continue
+        }
+        if char == '"' {
+            quoted = true
+            continue
+        }
+        switch char {
+        case '{', '[':
+            stack = append(stack, char)
+        case '}', ']':
+            if len(stack) == 0 {
+                return 0, false
+            }
+            opening := stack[len(stack)-1]
+            if (opening == '{' && char != '}') || (opening == '[' && char != ']') {
+                return 0, false
+            }
+            stack = stack[:len(stack)-1]
+            if len(stack) == 0 {
+                return index, true
+            }
+        }
+    }
+    return 0, false
+}
+
+func requestLike(payload map[string]any) bool {
+    _, hasMessages := payload["messages"]
+    _, hasInput := payload["input"]
+    _, hasTools := payload["tools"]
+    _, hasChoice := payload["tool_choice"]
+    return (hasMessages || hasInput) && (hasTools || hasChoice)
+}
+
+func scorePayload(provider string, payload map[string]any) int {
+    score := 0
+    if requestLike(payload) {
+        score -= 12
+    }
+    if provider == "anthropic" {
+        if _, ok := payload["content"].([]any); ok { score += 8 }
+        if payload["type"] == "message" { score += 4 }
+        if payload["role"] == "assistant" { score += 3 }
+        if payload["stop_reason"] != nil { score += 2 }
+        return score
+    }
+    if choices, ok := payload["choices"].([]any); ok && len(choices) > 0 {
+        score += 8
+        if first, ok := choices[0].(map[string]any); ok {
+            if _, ok := first["message"].(map[string]any); ok { score += 4 }
+            if first["finish_reason"] != nil { score += 2 }
+        }
+    }
+    if payload["object"] == "chat.completion" { score += 3 }
+    if id, ok := payload["id"].(string); ok && strings.HasPrefix(id, "chatcmpl") { score += 2 }
+    return score
+}
+
+func parseBestPayload(text, provider string) (map[string]any, bool) {
+    bestScore := 0
+    var best map[string]any
+    for _, candidate := range jsonCandidates(text) {
+        var payload map[string]any
+        if err := json.Unmarshal(candidate, &payload); err != nil {
+            continue
+        }
+        score := scorePayload(provider, payload)
+        if score > bestScore {
+            bestScore = score
+            best = payload
+        }
+    }
+    return best, best != nil
+}
+
+func parseCalls(payload map[string]any, provider string) ([]ToolCall, string) {
+    if provider == "anthropic" {
+        return parseAnthropicCalls(payload)
+    }
+    return parseOpenAICalls(payload)
+}
+
+func parseOpenAICalls(payload map[string]any) ([]ToolCall, string) {
+    choices, _ := payload["choices"].([]any)
+    if len(choices) == 0 { return nil, textValue(payload["content"]) }
+    first, _ := choices[0].(map[string]any)
+    message, _ := first["message"].(map[string]any)
+    calls, _ := message["tool_calls"].([]any)
+    result := make([]ToolCall, 0, len(calls))
+    for index, raw := range calls {
+        item, _ := raw.(map[string]any)
+        function, _ := item["function"].(map[string]any)
+        result = append(result, ToolCall{
+            ID: stringOr(item["id"], fmt.Sprintf("call_%d", index+1)),
+            Name: stringOr(function["name"], stringOr(item["name"], "")),
+            Arguments: normalizeArguments(firstNonNil(function["arguments"], item["arguments"])),
+        })
+    }
+    return result, textValue(message["content"])
+}
+
+func parseAnthropicCalls(payload map[string]any) ([]ToolCall, string) {
+    blocks, _ := payload["content"].([]any)
+    result := make([]ToolCall, 0)
+    var text strings.Builder
+    for index, raw := range blocks {
+        block, _ := raw.(map[string]any)
+        if block["type"] == "tool_use" {
+            result = append(result, ToolCall{
+                ID: stringOr(block["id"], fmt.Sprintf("toolu_%d", index+1)),
+                Name: stringOr(block["name"], ""),
+                Arguments: normalizeArguments(block["input"]),
+            })
+            continue
+        }
+        if block["type"] == "text" {
+            text.WriteString(textValue(block["text"]))
+        }
+    }
+    return result, text.String()
+}
+
+func ParseSimulation(text, provider string, declared []ToolDefinition) SimulationResult {
+    tools := FlattenTools(declared)
+    payload, ok := parseBestPayload(text, provider)
+    if !ok {
+        return SimulationResult{Content: text, FinishReason: "stop"}
+    }
+    result := SimulationResult{Content: textValue(payload["content"]), HasPayload: true, FinishReason: "stop"}
+    calls, content := parseCalls(payload, provider)
+    if content != "" {
+        result.Content = content
+    }
+    required := RequiredByTool(tools)
+    for _, call := range calls {
+        key, definition, allowed := resolveTool(call.Name, call.Namespace, tools)
+        if !allowed {
+            continue
+        }
+        call.Namespace = definition.Namespace
+        call.Name = ToolName(definition)
+        if !satisfiesRequired(call.Arguments, required[key]) {
+            result.DroppedMissingArgs = append(result.DroppedMissingArgs, call.Name)
+            continue
+        }
+        result.ToolCalls = append(result.ToolCalls, call)
+    }
+    if len(result.ToolCalls) > 0 {
+        result.FinishReason = "tool_calls"
+    }
+    return result
+}
+
+func stringOr(value any, fallback string) string {
+    if text, ok := value.(string); ok && text != "" { return text }
+    return fallback
+}
+
+func textValue(value any) string {
+    text, _ := value.(string)
+    return text
+}
+
+func firstNonNil(values ...any) any {
+    for _, value := range values {
+        if value != nil { return value }
+    }
+    return nil
+}
+```
+
+The parser is deliberately provider-neutral until `parseOpenAICalls` or `parseAnthropicCalls` is selected. It never executes a tool. The `declared` slice is the only source of callable names, and namespace ambiguity is rejected rather than guessed.
+
+### Prompt construction
+
+Use the complete original request, not only the tool definitions. The request must be treated as data, delimited clearly, and never interpreted as instructions by the proxy itself:
+
+```go
+func BuildSimulationPrompt(provider, requestJSON string, required map[string][]string) string {
+    format := `{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[]},"finish_reason":"stop"}]}`
+    if provider == "anthropic" {
+        format = `{"type":"message","role":"assistant","content":[{"type":"text","text":""}],"stop_reason":"end_turn"}`
+    }
+    return "You are an adapter that must produce exactly one JSON object.\n" +
+        "Do not return prose or Markdown outside the object.\n" +
+        "Use only tool names declared in the request. Never invent a tool name.\n" +
+        "Every required argument must be present, non-null, and non-empty.\n" +
+        "If a tool is selected, use the provider-native shape.\n" +
+        "Expected shape:\n" + format + "\n" +
+        "BEGIN_REQUEST_JSON\n" + requestJSON + "\nEND_REQUEST_JSON\n" +
+        fmt.Sprintf("Required arguments: %v", required)
+}
+```
+
+The target model backend may require different prompt wording, but the output contract, declaration allowlist, and required-field rule must remain unchanged. Prompt text is a formatting aid, not an authorization boundary.
+
+### Corrective retry and upstream boundary
+
+```go
+type UpstreamResult struct {
+    Text           string
+    Thinking       string
+    ConversationID string
+}
+
+type Upstream interface {
+    Complete(ctx context.Context, messages []string, conversationID string, stream bool, hasTools bool) (UpstreamResult, error)
+}
+
+type ConversationStore interface {
+    Get(sessionID string) string
+    Set(sessionID, conversationID string)
+    Delete(sessionID string)
+}
+
+func SimulateWithRepair(ctx context.Context, upstream Upstream, store ConversationStore,
+    sessionID, provider, requestJSON string, messages []string, tools []ToolDefinition,
+) (SimulationResult, string, error) {
+    conversationID := store.Get(sessionID)
+    prompt := BuildSimulationPrompt(provider, requestJSON, RequiredByTool(FlattenTools(tools)))
+    current := append([]string(nil), messages...)
+    if len(current) == 0 {
+        current = []string{""}
+    }
+    current[len(current)-1] = prompt
+    response, err := upstream.Complete(ctx, current, conversationID, false, true)
+    if err != nil { return SimulationResult{}, conversationID, err }
+    conversationID = response.ConversationID
+    parsed := ParseSimulation(response.Text, provider, tools)
+    if len(parsed.ToolCalls) == 0 && len(parsed.DroppedMissingArgs) > 0 {
+        repair := "Correction: the previous call omitted required arguments. Return the same provider shape again with every required argument present and non-empty. Rejected tools: " + strings.Join(parsed.DroppedMissingArgs, ", ")
+        current[len(current)-1] += "\n\n" + repair
+        response, retryErr := upstream.Complete(ctx, current, conversationID, false, true)
+        if retryErr == nil {
+            retryParsed := ParseSimulation(response.Text, provider, tools)
+            if len(retryParsed.ToolCalls) > 0 || retryParsed.HasPayload {
+                parsed = retryParsed
+                conversationID = response.ConversationID
+            }
+        }
+    }
+    if conversationID != "" { store.Set(sessionID, conversationID) }
+    return parsed, conversationID, nil
+}
+```
+
+The retry is bounded to one corrective re-ask for the shared OpenAI and Anthropic flow. A Responses adapter may add its separate required-call retry and empty-upstream retry, but those retry causes must remain independent and bounded. The code snippets in this section are the portable core, not a complete HTTP server: connect `Upstream`, `ConversationStore`, provider request decoding, response encoders, and authentication to the target project.
+
+### Provider-native response encoding
+
+```go
+func EncodeOpenAIChat(result SimulationResult) map[string]any {
+    calls := make([]map[string]any, 0, len(result.ToolCalls))
+    for _, call := range result.ToolCalls {
+        calls = append(calls, map[string]any{
+            "id": call.ID, "type": "function",
+            "function": map[string]any{"name": call.Name, "arguments": string(call.Arguments)},
+        })
+    }
+    message := map[string]any{"role": "assistant", "content": result.Content}
+    if len(calls) > 0 { message["content"] = nil; message["tool_calls"] = calls }
+    return map[string]any{"choices": []any{map[string]any{
+        "index": 0, "message": message, "finish_reason": result.FinishReason,
+    }}}
+}
+
+func EncodeAnthropic(result SimulationResult) map[string]any {
+    content := make([]map[string]any, 0, len(result.ToolCalls)+1)
+    if result.Content != "" { content = append(content, map[string]any{"type": "text", "text": result.Content}) }
+    for _, call := range result.ToolCalls {
+        var input map[string]any
+        if err := json.Unmarshal(call.Arguments, &input); err != nil { input = map[string]any{} }
+        content = append(content, map[string]any{"type": "tool_use", "id": call.ID, "name": call.Name, "input": input})
+    }
+    stop := "end_turn"
+    if len(result.ToolCalls) > 0 { stop = "tool_use" }
+    return map[string]any{"type": "message", "role": "assistant", "content": content, "stop_reason": stop}
+}
+
+func EncodeResponses(result SimulationResult) map[string]any {
+    output := make([]map[string]any, 0, len(result.ToolCalls)+1)
+    if result.Content != "" { output = append(output, map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": result.Content}}}) }
+    for _, call := range result.ToolCalls {
+        item := map[string]any{"type": "function_call", "call_id": call.ID, "name": call.Name, "arguments": string(call.Arguments)}
+        if call.Namespace != "" { item["namespace"] = call.Namespace }
+        output = append(output, item)
+    }
+    return map[string]any{"output": output, "status": "completed"}
+}
+```
+
+These encoders are the public boundary. Do not serialize the internal OpenAI-shaped envelope directly to Anthropic or Responses clients.
+
+### Local execution loop
+
+```go
+type LocalExecutor interface {
+    IsLocal(name string) bool
+    Execute(ctx context.Context, name string, arguments map[string]any) (any, error)
+}
+
+func RunLocalLoop(ctx context.Context, executor LocalExecutor, maxIterations int,
+    call func(context.Context, []string) (SimulationResult, error), messages []string,
+) (SimulationResult, error) {
+    seen := make(map[string]struct{})
+    for iteration := 0; iteration < maxIterations; iteration++ {
+        result, err := call(ctx, messages)
+        if err != nil { return SimulationResult{}, err }
+        local := make([]ToolCall, 0)
+        callerOwned := make([]ToolCall, 0)
+        for _, toolCall := range result.ToolCalls {
+            if executor.IsLocal(toolCall.Name) { local = append(local, toolCall) } else { callerOwned = append(callerOwned, toolCall) }
+        }
+        if len(callerOwned) > 0 { result.ToolCalls = callerOwned; return result, nil }
+        if len(local) == 0 { return result, nil }
+        for _, toolCall := range local {
+            key := toolCall.Name + "\x00" + string(toolCall.Arguments)
+            if _, exists := seen[key]; exists { return SimulationResult{}, fmt.Errorf("duplicate local tool call: %s", toolCall.Name) }
+            seen[key] = struct{}{}
+            arguments, ok := argumentObject(toolCall.Arguments)
+            if !ok { arguments = map[string]any{} }
+            value, executeErr := executor.Execute(ctx, toolCall.Name, arguments)
+            encoded, marshalErr := json.Marshal(map[string]any{"tool": toolCall.Name, "result": value, "error": errorText(executeErr)})
+            if marshalErr != nil { return SimulationResult{}, marshalErr }
+            messages = append(messages, "[Tool Result for "+toolCall.Name+" (call_id: "+toolCall.ID+")]\n"+string(encoded))
+        }
+    }
+    return SimulationResult{}, fmt.Errorf("local tool iteration limit reached")
+}
+
+func errorText(err error) string {
+    if err == nil { return "" }
+    return err.Error()
+}
+```
+
+The loop returns caller-owned calls before executing any local calls from the same response. The local executor must still enforce authentication, workspace containment, protected paths, timeouts, output limits, process-tree termination, and deployment isolation.
 
 ## Terminology
 
@@ -88,7 +669,7 @@ Client request
       -> return final answer or caller-owned call
 ```
 
-The central adapter is `pkg/servers/api.go`. The M365 transport stays stateless across requests. Per-request text, thinking, tool calls, finish reason, and conversation ID travel through `client.StreamChunk` at `pkg/client/client.go::248`.
+The HTTP adapter is the provider-facing boundary. The M365 transport stays stateless across requests. Per-request text, thinking, tool calls, finish reason, and conversation ID must remain request-local and travel through an explicit stream-result object.
 
 ## Why simulation is required
 
@@ -99,7 +680,7 @@ The implemented bridge uses two coordinated controls:
 1. Prompt control: embed the complete provider request and require a provider-shaped JSON response.
 2. Infrastructure control: remove M365 code-interpreter option sets whenever caller-defined tools are present.
 
-The second control is essential. Without it, M365 can intercept file or code requests and run its own sandbox instead of producing a call for a client-declared tool. The option filtering is implemented by `codeInterpreterOptions` and `getOptions` at `pkg/payload/payload.go::57` and `pkg/payload/payload.go::552`.
+The second control is essential. Without it, M365 can intercept file or code requests and run its own sandbox instead of producing a call for a client-declared tool. The upstream request builder must remove conflicting code-interpreter option sets whenever caller-defined tools are active.
 
 ## Three distinct execution paths
 
@@ -114,18 +695,18 @@ M365 emits tool activity as SignalR type 1 `update` messages. The transport maps
 | `TriggerPlugin`       | `trigger_plugin`         |
 | `InvokeAction`        | `invoke_action`          |
 
-The map is defined at `pkg/models/models.go::93`. `extractToolCall` converts message text into arguments at `pkg/client/client.go::552`:
+A backend message-type map converts recognized backend activity into compatible function names. A transport extractor converts each activity into a call and its arguments:
 
 - `InternalSearchQuery` becomes `{"query":"..."}`.
 - `GeneratedCode` becomes `{"code":"..."}`.
 - Other mapped events become `{"input":"..."}`.
 - `messageId` becomes the call ID. A UUID is generated if it is absent.
 
-M365 may also expose web-search terms in a Progress message's `searchQueries` field. Each query becomes a `search` call through `makeSearchToolCall` at `pkg/client/client.go::598`.
+M365 may also expose web-search terms in a Progress message's `searchQueries` field. Each query becomes a `search` call through the transport's search-call converter.
 
-The transport collects backend calls and publishes them only on the final `StreamChunk`. SignalR type 2 provides the final conversation ID, and type 3 ends the request and assigns `tool_calls` when any calls were collected. See `pkg/client/client.go::466` and `pkg/client/client.go::473`.
+The transport collects backend calls and publishes them only on the final `StreamChunk`. SignalR type 2 provides the final conversation ID, and type 3 ends the request and assigns `tool_calls` when any calls were collected. See the SignalR receive loop in `the transport layer`.
 
-When caller-defined tools are active, handlers deliberately discard backend tool calls. This prevents M365-invented `code_interpreter` or other backend operations from being misrepresented as declared client functions. Examples are `pkg/servers/api.go::1336`, `pkg/servers/api.go::1447`, and `pkg/servers/api.go::1722`.
+When caller-defined tools are active, handlers deliberately discard backend tool calls. This prevents M365-invented `code_interpreter` or other backend operations from being misrepresented as declared client functions. Examples are the simulated branches of `streamChatCompletions`, `nonStreamChatCompletions`, and `streamAnthropicMessages` in the HTTP adapter.
 
 ### Caller-defined simulated tools
 
@@ -149,7 +730,7 @@ The full request is embedded because the model needs messages, tool schemas, `to
 
 ### Built-in local coding tools
 
-Built-in tools are disabled by default. `M365_ENABLE_CODE_TOOLS` creates a `codingtools.Manager` during API server startup at `pkg/servers/api.go::150`. A startup failure is fatal if the workspace cannot be canonicalized or limits are invalid.
+Built-in tools are disabled by default. `M365_ENABLE_CODE_TOOLS` creates the local tool manager during API server startup. A startup failure is fatal if the workspace cannot be canonicalized or limits are invalid.
 
 When enabled:
 
@@ -159,7 +740,7 @@ When enabled:
 - Caller-owned names remain caller-owned and are returned to the caller.
 - Local calls are executed by the server and fed back to M365 until a final answer or caller-owned call appears.
 
-The preparation logic is at `pkg/servers/api.go::557`. Automatic schema conversion preserves each provider's shape:
+Preparation must preserve each provider's native schema shape:
 
 - OpenAI: `{type:"function", function:{name,description,parameters}}`
 - Anthropic: `{name,description,input_schema}`
@@ -168,15 +749,18 @@ The preparation logic is at `pkg/servers/api.go::557`. Automatic schema conversi
 
 ### Effective tool definition
 
-`toolcalling.ToolDef` supports both provider shapes at `pkg/toolcalling/toolcalling.go::19`:
+`toolcalling.ToolDef` supports both provider shapes at the shared tool model:
 
 ```go
 type ToolDef struct {
     Type        string
+    Namespace   string
     Function    ToolDefFunc
     Name        string
     Description string
     InputSchema map[string]any
+    Tools       []ToolDef
+    Parameters  map[string]any
 }
 ```
 
@@ -190,6 +774,7 @@ The simulation parser returns:
 type ToolCall struct {
     ID        string
     Name      string
+    Namespace string
     Arguments json.RawMessage
 }
 ```
@@ -198,14 +783,15 @@ The HTTP adapter converts it to `client.ToolCall`, whose `Function.Arguments` is
 
 ### Simulation result
 
-`SimulatedResult` at `pkg/toolcalling/simulated.go::102` carries:
+`SimulatedResult` at the simulation engine carries:
 
 - `Content`: final assistant text when no accepted call exists.
 - `ToolCalls`: accepted parsed calls.
 - `FinishReason`: internal `tool_calls` or `stop`.
 - `HasPayload`: whether a usable provider-shaped object was found.
+- `DroppedMissingArgs`: names of calls removed because required top-level arguments were missing, null, empty, or whitespace-only.
 
-`HasPayload` distinguishes valid plain-text provider output from raw M365 prose that failed simulation parsing.
+`HasPayload` distinguishes valid plain-text provider output from raw M365 prose that failed simulation parsing. `DroppedMissingArgs` is the signal used by the corrective retry path.
 
 ### Tool-result text
 
@@ -219,20 +805,20 @@ Arguments: JSON
 RESULT
 ```
 
-OpenAI and Anthropic request decoding performs this conversion in `payload.Message.UnmarshalJSON` at `pkg/payload/payload.go::115`. Local loop results use:
+OpenAI and Anthropic request decoding performs this conversion in the provider history decoder. Local loop results use:
 
 ```text
 [Tool Result for TOOL_NAME (call_id: CALL_ID)]
 SERIALIZED_RESULT
 ```
 
-The formatter is at `pkg/toolcalling/simulated.go::670`.
+The formatter is at the simulation engine.
 
 ## Prompt contracts
 
 ### OpenAI prompt
 
-`BuildSimulatedPrompt` at `pkg/toolcalling/simulated.go::21` instructs M365 to:
+the OpenAI prompt builder instructs M365 to:
 
 - Treat the embedded JSON as a complete `POST /v1/chat/completions` request.
 - Return exactly one Markdown `json` code block and no surrounding prose.
@@ -253,9 +839,22 @@ OpenAI `tool_choice` handling:
 
 The current `none` handling relies on the embedded request semantics rather than adding an explicit prohibition sentence. A port should preserve this only if its target model reliably follows the embedded field.
 
+### Responses prompt
+
+`BuildSimulatedPromptResponses` preserves Responses-specific input and output semantics while using a private chat-completion-shaped envelope between the prompt and parser. The prompt must:
+
+- Treat `input` as a sequence containing messages, `function_call`, `function_call_output`, `tool_search_call`, and `tool_search_output` items.
+- Apply `instructions` to the full request.
+- Combine request `tools` with definitions loaded from prior `tool_search_output` or `additional_tools` items.
+- Preserve a namespace function's short `name` and carry its namespace separately.
+- Treat `tool_search` as a callable tool.
+- Return string `function.arguments` in the internal envelope, while the public adapter emits Responses `function_call` items.
+
+The private envelope must never be exposed as the public Responses wire format.
+
 ### Anthropic prompt
 
-`BuildSimulatedPromptAnthropic` at `pkg/toolcalling/simulated.go::62` requests a complete Anthropic Messages object:
+the Anthropic prompt builder requests a complete Anthropic Messages object:
 
 - Calls are `content` blocks with `type: "tool_use"`.
 - `stop_reason` is `tool_use` when calls exist.
@@ -273,13 +872,13 @@ Anthropic `tool_choice.type` handling:
 
 ### Prompt injection point
 
-`injectSimulatedPrompt` and `injectSimulatedPromptAnthropic` replace the last user message rather than adding an unrelated trailing system message. See `pkg/servers/api.go::2366` and `pkg/servers/api.go::2382`.
+Inject the simulation prompt by replacing the last user message rather than adding an unrelated trailing system message.
 
-`BuildConversationPayload` sends only the latest message because M365 tracks prior turns through `ConversationId`. Earlier system messages are prefixed to that latest text. It does not send a `messageHistory` array. See `pkg/payload/payload.go::369`.
+`BuildConversationPayload` sends only the latest message because M365 tracks prior turns through `ConversationId`. Earlier system messages are prefixed to that latest text. It does not send a `messageHistory` array. See `the payload builder`, `BuildConversationPayload`.
 
 ## JSON extraction and parser strategy
 
-Model output is not trusted to contain one perfect fenced object. `enumerateJSONCandidates` at `pkg/toolcalling/simulated.go::532` generates candidates from:
+Model output is not trusted to contain one perfect fenced object. the candidate enumerator generates candidates from:
 
 1. The complete trimmed response.
 2. Every fenced code block body.
@@ -291,7 +890,7 @@ Candidate strings are deduplicated while preserving discovery order. Balanced sc
 
 The embedded request itself is JSON and models can echo it. The response may also contain nested JSON, prose, or multiple code blocks. Selecting the first parseable object is therefore unsafe.
 
-OpenAI scoring at `pkg/toolcalling/simulated.go::461` rewards:
+OpenAI candidate scoring rewards:
 
 - A non-empty `choices` array.
 - `choices[0].message`.
@@ -303,7 +902,7 @@ OpenAI scoring at `pkg/toolcalling/simulated.go::461` rewards:
 
 It penalizes request-like objects containing messages or input plus tools or tool-choice signals.
 
-Anthropic scoring at `pkg/toolcalling/simulated.go::271` rewards:
+Anthropic candidate scoring rewards:
 
 - A non-empty content array.
 - `tool_use` and text blocks.
@@ -332,23 +931,23 @@ The Anthropic parser expects `content` blocks but also accepts a top-level `text
 
 ### Name allowlisting
 
-Both parsers receive names extracted from the effective tool list through `toolNamesFromDefs`, which delegates provider normalization to the provider-neutral `toolcalling.ToolName` helper. It reads OpenAI's nested `function.name` and Anthropic's flat `name`. Any generated call with a different name is discarded. This is the final defense against M365-invented backend tools leaking into caller-defined output. The extraction path is covered by `TestToolNamesFromDefsSupportsProviderShapes` at `pkg/servers/api_test.go::10`.
+Both parsers receive names extracted from the effective tool list through `toolNamesFromDefs`, which delegates provider normalization to the provider-neutral `toolcalling.ToolName` helper. It reads OpenAI's nested `function.name` and Anthropic's flat `name`. Any generated call with a different name is discarded. This is the final defense against M365-invented backend tools leaking into caller-defined output. The extraction path is covered by `TestToolNamesFromDefsSupportsProviderShapes` at `the adapter test suite`, `TestToolNamesFromDefsSupportsProviderShapes`.
 
-A port must use the same provider-neutral normalization for preparation and allowlisting. Applying an OpenAI-only extractor to Anthropic definitions produces an empty allowlist and disables name filtering. Apply the allowlist after parsing and before execution or response emission. Prompt instructions alone are not a security boundary.
+A port must use the same provider-neutral normalization for preparation and allowlisting. Applying an OpenAI-only extractor to Anthropic definitions produces an empty allowlist and disables name filtering. Apply the allowlist after parsing and before execution or response emission. For Responses, apply namespace resolution after name allowlisting and reject an unqualified name when multiple namespaces match. Prompt instructions alone are not a security boundary.
 
 ### Required-argument validation and corrective re-ask
 
 The backend can emit a structurally valid tool call that omits schema-required fields (for example an `Agent`/`Task` call with an empty `description` or `prompt`). Forwarding such a call makes agent clients reject it and retry forever. Two layers guard against this.
 
-First, prevention: `RequiredArgsByTool` at `pkg/toolcalling/simulated.go::152` reads each tool's `input_schema.required` (Anthropic) or `function.parameters.required` (OpenAI), and the simulated prompts instruct the model to populate every required field with a concrete non-empty value. `toolCallSatisfiesRequired` then drops any call whose required arguments are missing, null, or empty strings, recording the offending tool name in `SimulatedResult.DroppedMissingArgs`.
+First, prevention: `RequiredArgsByTool` at `the simulation engine` reads top-level `required` arrays from Anthropic `input_schema`, OpenAI Chat `function.parameters`, or Responses function `parameters`. It accepts both JSON-decoded `[]any` and programmatic `[]string`. The simulated prompts instruct the model to populate every required field with a concrete non-empty value. `toolCallSatisfiesRequired` then drops a call when its arguments are not a JSON object, a required key is absent, the value is `null`, or a string value is empty or whitespace-only. The offending tool name is recorded in `SimulatedResult.DroppedMissingArgs`.
 
-Second, correction: when a parse drops every tool call for missing required arguments and yields no usable call, `repairSimulatedToolCalls` at `pkg/servers/api.go` re-sends the request once with an appended corrective note (`BuildRepairNote`) naming the offending tools and their required fields, then re-parses. A recovered call replaces the empty turn; if the retry still fails, the original response is returned instead of looping. This corrective re-ask is wired into every simulated tool endpoint: OpenAI Chat Completions and Completions (streaming and non-streaming), Anthropic Messages (streaming and non-streaming), the coding-tool `runToolLoop`, and the OpenAI Responses empty-retry path.
+Second, correction: when a parse drops every tool call for missing required arguments and yields no usable call, `repairSimulatedToolCalls` at the HTTP adapter re-sends the request once with an appended corrective note (`BuildRepairNote`) naming the offending tools and their required fields, then re-parses. A recovered call replaces the empty turn; if the retry still fails, the original response is returned instead of looping. Responses uses its own required-call retry path, `parseResponsesSimulationWithRetry`, and can perform up to two required-call re-asks. Its empty-upstream retry is separate. This distinction must be preserved when porting.
 
 ### Plain-text fallback and finish reasons
 
 If a valid provider-shaped payload contains no accepted calls, its content is returned and the finish reason becomes `stop` or Anthropic `end_turn`.
 
-If no usable payload exists, raw M365 text is returned. Backend calls are still discarded for tool-bearing simulated requests, and the finish reason is reset so the API never reports `tool_calls` or `tool_use` without corresponding call blocks. See `pkg/servers/api.go::1472` and `pkg/servers/api.go::1872`.
+If no usable payload exists, raw upstream text is returned. Backend calls are still discarded for tool-bearing simulated requests, and the finish reason is reset so the API never reports `tool_calls` or `tool_use` without corresponding call blocks.
 
 ## Provider endpoint behavior
 
@@ -365,15 +964,15 @@ Request fields used by tool calling:
 - `session_id` or `user`
 - optional session suffix in `model`
 
-Non-streaming calls appear under `choices[0].message.tool_calls`, with `content: null` when there is no text and `finish_reason: "tool_calls"`. See `pkg/servers/api.go::1439`.
+Non-streaming calls appear under `choices[0].message.tool_calls`, with `content: null` when there is no text and `finish_reason: "tool_calls"`.
 
-Streaming emits one or more `chat.completion.chunk` events with `delta.tool_calls`, followed by a final chunk whose finish reason is `tool_calls`, then `[DONE]`. See `pkg/servers/api.go::1217`.
+Streaming emits one or more `chat.completion.chunk` events with `delta.tool_calls`, followed by a final chunk whose finish reason is `tool_calls`, then `[DONE]`.
 
 ### OpenAI Completions
 
 Endpoint: `POST /v1/completions`
 
-The FIM prompt is converted into one chat message, then the complete Completions request is embedded in the OpenAI simulation prompt. See `pkg/servers/api.go::782`.
+The FIM prompt is converted into one chat message, then the complete Completions request is embedded in the OpenAI simulation prompt.
 
 Non-streaming tool calls are a non-standard top-level `tool_calls` extension on the text-completion response. Streaming detects calls and sets the final `finish_reason` to `tool_calls`, but does not emit call bodies in text-completion chunks. Consumers needing standard function-call output should use Chat Completions or Responses.
 
@@ -410,9 +1009,8 @@ Streaming remains Anthropic-native:
 5. `message_delta` with `stop_reason: "tool_use"`
 6. `message_stop`
 
-Step 4 must stream the arguments as `input_json_delta`, not inline them in `content_block_start.input`. SDK clients (Claude Code) build tool input by accumulating `partial_json` and ignore the `input` on the start event; inlining the arguments makes the client see an empty input and retry the tool call in an endless loop. See `pkg/servers/api.go` in `streamAnthropicMessages`.
+Step 4 must stream the arguments as `input_json_delta`, not inline them in `content_block_start.input`. SDK clients (Claude Code) build tool input by accumulating `partial_json` and ignore the `input` on the start event; inlining the arguments makes the client see an empty input and retry the tool call in an endless loop. See the HTTP adapter in `streamAnthropicMessages`.
 
-See `pkg/servers/api.go::1551`.
 
 ### OpenAI Responses
 
@@ -424,13 +1022,38 @@ Responses input conversion recognizes:
 - Message items.
 - `function_call` history items, converted into assistant text as `Tool call: NAME(ARGUMENTS)`.
 - `function_call_output` result items, converted into a tool-role message whose plain text includes the original `call_id` and output.
-- Reasoning items, which are skipped because M365 generates its own reasoning.
+- `reasoning` items, which are skipped during M365 message conversion because M365 generates its own reasoning stream.
 
-The `call_id` must remain in the message content because `BuildConversationPayload` sends only the last message's text and does not serialize `Message.Name` or `Message.ToolCallID` as separate M365 fields. See `responsesInputToMessages` at `pkg/servers/api.go::2639`, `BuildConversationPayload` at `pkg/payload/payload.go::369`, and `TestResponsesInputToMessagesPreservesFunctionCallOutputID` at `pkg/servers/api_test.go::22`.
+Responses tool definitions include top-level function `parameters` and may include namespace containers:
 
-Compatible output uses one `function_call` item per call with `call_id`, `name`, and string `arguments`. The response builder is at `pkg/servers/api.go::2742`.
+```json
+{
+  "type": "namespace",
+  "namespace": "workspace",
+  "tools": [
+    {
+      "type": "function",
+      "name": "read_file",
+      "description": "Read a file",
+      "parameters": {"type": "object", "required": ["path"]}
+    }
+  ]
+}
+```
 
-Both streaming and non-streaming modes support simulated calls. Built-in local execution also applies to this endpoint through `runToolLoop` at `pkg/servers/api.go::2623`.
+The adapter flattens nested namespace definitions, preserves the namespace, and deduplicates by namespace plus short name. A short name without a namespace is accepted only when exactly one namespace matches. If the same short name exists in multiple namespaces, the unqualified call is rejected as ambiguous.
+
+Definitions in `tool_search_output` and `additional_tools` are merged into the callable set. A duplicate namespace/name pair is retained only once. A `tool_search` definition is emitted as a `tool_search_call` with `execution: "client"`, rather than as a normal function call.
+
+The `call_id` must remain in the message content because the upstream payload sends only the latest message text and does not serialize tool metadata as separate fields.
+
+Compatible output uses one `function_call` item per call with `call_id`, `name`, optional `namespace`, and string `arguments`. The output builder is `buildResponsesObject` at the HTTP adapter; `buildResponsesToolCallItem` constructs function and tool-search item variants.
+
+Both streaming and non-streaming modes support simulated calls. Built-in local execution also applies to this endpoint through `runToolLoop` at the HTTP adapter.
+
+`Responses` has two independent retry conditions. Required-call retry re-prompts when `tool_choice` requires a call but parsing produces no valid declared call. Empty-upstream retry handles a response with neither text nor a tool call, resets the conversation ID before retrying, and uses a shorter retry schedule when simulation is active. These are not the same retry and must not be merged.
+
+Responses streaming emits `response.created` and `response.in_progress`, then streams reasoning summary deltas live. Simulated tool mode filters the transport envelope from reasoning and incrementally extracts user-facing content while retaining the raw stream for final JSON parsing. After parsing, it emits message completion events and function-call argument delta/done events. The reasoning stream is not suppressed merely because simulation is enabled.
 
 ### Responses compaction
 
@@ -440,21 +1063,19 @@ Compaction is a context summarization surface, not a tool execution surface. Do 
 
 ### Anthropic Complete and token counting
 
-`/v1/complete` has no caller-defined tool request fields. `/v1/messages/count_tokens` includes raw tool definitions in the counted JSON but does not invoke tools. See `pkg/servers/api.go::878` and `pkg/servers/api.go::1015`.
+`/v1/complete` has no caller-defined tool request fields. A token-counting endpoint may include raw tool definitions in counted JSON but must not invoke tools.
 
 ## Streaming and buffering
 
-Tool simulation requires the final JSON object, so text cannot be parsed safely chunk by chunk. A tool-call object may span arbitrary SignalR chunks. Therefore:
+Tool simulation requires the final JSON object, so the raw simulated response cannot be parsed safely chunk by chunk. A tool-call object may span arbitrary SignalR chunks. The four streaming surfaces do not have identical buffering behavior:
 
-- Requests without tools stream text immediately.
-- Requests with tools buffer model text until the M365 stream ends.
-- Thinking content can still be emitted as provider-compatible reasoning before text parsing in ordinary simulated handlers.
-- Once parsing completes, buffered text or tool calls are emitted in provider-native form.
-- Built-in local-tool loops buffer the complete multi-round operation even if `stream: true`, then replay a provider-compatible buffered response.
+- OpenAI Chat Completions and Anthropic Messages stream upstream thinking live through a stateful filter, but buffer simulated text until the M365 stream ends. They then parse the complete response and emit provider-native text or tool-call events.
+- OpenAI Completions follows the same complete-response parsing rule, but its tool-call extension is non-standard. Streaming reports the final `tool_calls` finish reason without standard function-call deltas.
+- OpenAI Responses streams reasoning summary deltas live and uses `ContentStreamExtractor` to publish decoded user-facing content incrementally. It retains the raw text for final simulated parsing, then emits Responses message and function-call events. Required-call retry or empty-upstream retry can replace the initial response before final events are committed.
+- Requests without caller-defined tools stream text directly from the upstream transport. Responses still uses its Responses event envelope and its separate empty-upstream retry policy.
+- Built-in local-tool loops resolve the complete multi-round operation before replaying a provider-compatible buffered result. A mixed response containing caller-owned calls returns those calls immediately and executes no local calls from that response.
 
-This behavior is visible in OpenAI streaming at `pkg/servers/api.go::1240` and Anthropic streaming at `pkg/servers/api.go::1593`.
-
-A port must document this latency and chunking difference. Setting `stream: true` does not guarantee immediate content when tool selection depends on full-response parsing.
+Thinking or reasoning is not suppressed by simulated tool calling. It is filtered only to remove the simulated transport envelope. A port must document this latency and chunking difference. Setting `stream: true` does not guarantee immediate simulated tool-call content when selection depends on full-response parsing.
 
 ## Caller-executed continuation
 
@@ -487,7 +1108,7 @@ Anthropic history:
 
 ## Local built-in execution loop
 
-`runToolLoop` at `pkg/servers/api.go::606` owns one request-local loop:
+The local executor owns one request-local loop:
 
 1. Call M365 with the current upstream conversation ID.
 2. Update the conversation ID from the completed SignalR invocation.
@@ -546,7 +1167,7 @@ Optional fields use `omitempty`. Tool failures are model-visible results unless 
 
 ## Built-in tool catalog
 
-All schemas set `type: "object"`, reject additional properties, and mark required inputs explicitly. The source is `pkg/codingtools/codingtools.go::77`.
+All built-in schemas should set `type: "object"`, reject additional properties, and mark required inputs explicitly.
 
 | Tool            | Inputs                                              | Operation                                                                       |
 |-----------------|-----------------------------------------------------|---------------------------------------------------------------------------------|
@@ -625,7 +1246,7 @@ The manager establishes one canonical workspace at startup:
 4. Require an existing directory.
 5. Store the cleaned canonical path.
 
-Every file path is workspace-relative. `resolve` at `pkg/codingtools/codingtools.go::159` rejects:
+Every file path is workspace-relative. The path resolver rejects:
 
 - Absolute paths.
 - `..` traversal out of the workspace.
@@ -663,7 +1284,7 @@ This is a project-specific denylist, not a general secret-detection system. A po
 
 ### Unix
 
-String commands run as `/bin/sh -c`. Each process starts in a new process group through `Setpgid`. Cancellation and explicit timeout termination send `SIGKILL` to the negative process ID, killing the full process group. See `pkg/codingtools/process_unix.go::12`.
+String commands run as `/bin/sh -c`. Each process starts in a new process group through `Setpgid`. Cancellation and explicit timeout termination send `SIGKILL` to the negative process ID, killing the full process group. See `the Unix process adapter`, `shellCommand`, `configureProcess`, `terminateProcess`.
 
 ### Windows
 
@@ -679,7 +1300,7 @@ Timeout cleanup invokes:
 taskkill /T /F /PID PID
 ```
 
-This targets the process tree. See `pkg/codingtools/process_windows.go::11`.
+This targets the process tree. See `the Windows process adapter`, `shellCommand`, `configureProcess`, `terminateProcess`.
 
 ### Limits
 
@@ -692,7 +1313,7 @@ These application limits do not replace OS-level isolation. For untrusted users,
 
 ## Configuration
 
-Configuration is read from process environment after loading `data/.env`. Process environment values take precedence. See `pkg/models/models.go::117`.
+Configuration is read from process environment after loading a local environment file. Process environment values take precedence.
 
 | Variable                        |   Default | Meaning                                                              |
 |---------------------------------|----------:|----------------------------------------------------------------------|
@@ -717,13 +1338,13 @@ The runtime image must contain:
 - Go for the default `run_tests` command.
 - CA certificates and timezone data for the base service.
 
-The project Dockerfile installs these runtime dependencies. Removing `git` or Go keeps the API process alive but makes corresponding built-in tools fail at execution time.
+The runtime image must install these dependencies. Removing `git` or Go keeps the API process alive but makes corresponding built-in tools fail at execution time.
 
 A workspace must also be visible inside the runtime environment. This project does not add an implicit Compose workspace mount. Deployment owners must deliberately choose and mount the workspace when local execution is wanted, because a mount broadens the service's filesystem authority.
 
 ## Conversation and session continuity
 
-M365 continuity is based on an upstream `ConversationId`, not replaying full history. The server maps a stable client session ID to that conversation ID through `ContextCache` at `pkg/servers/api.go::41`.
+M365 continuity is based on an upstream `ConversationId`, not replaying full history. The server maps a stable client session ID to that conversation ID through a conversation store.
 
 Relevant session inputs include:
 
@@ -752,7 +1373,7 @@ Calls absent from the effective declaration allowlist are dropped. If all calls 
 
 ### Local tool failure
 
-Validation failures, command non-zero exits, timeouts, and output truncation are encoded in `codingtools.Result` and sent back to the model. The model can retry with changed arguments, but an identical name and argument payload triggers duplicate-call rejection.
+Validation failures, command non-zero exits, timeouts, and output truncation are encoded in the structured local-tool result and sent back to the model. The model can retry with changed arguments, but an identical name and argument payload triggers duplicate-call rejection.
 
 ### Local-loop control failure
 
@@ -878,7 +1499,7 @@ Residual concern: directory entry count, total scanned bytes, CPU, memory, disk 
 
 ### Caller-defined protocol scripts
 
-`test_toolcalling_openai.sh` checks:
+An OpenAI protocol probe should check:
 
 - `write_file`, `read_file`, and `list_files` or a caller-declared `bash` alternative.
 - Correct `finish_reason` and `tool_calls` shape.
@@ -886,7 +1507,7 @@ Residual concern: directory entry count, total scanned bytes, CPU, memory, disk 
 - A final text response after the result.
 - M365 server-side search as a baseline.
 
-`test_toolcalling_anthropic.sh` checks equivalent behavior with `tool_use`, `tool_result`, and `stop_reason`.
+An Anthropic protocol probe should check equivalent behavior with `tool_use`, `tool_result`, and `stop_reason`.
 
 These scripts permit a skip when the probabilistic model answers directly instead of selecting a tool. They are integration probes, not deterministic parser unit tests.
 
@@ -918,7 +1539,7 @@ For changes limited to this document, there is no runtime surface. Validate link
 1. Tool selection is probabilistic because it is produced through prompting, not a native M365 function-call protocol.
 2. Streaming tool requests buffer text until a complete JSON object is available.
 3. OpenAI Completions uses a non-standard tool-call extension and does not execute built-in tools locally.
-4. Tool-schema compliance is encouraged in the prompt, but generated arguments are not validated against the declared caller schema before returning them.
+4. Required top-level arguments are validated before a parsed call is returned, including missing, null, empty, and whitespace-only values. The implementation does not perform full JSON Schema validation for nested constraints, general types, enums, formats, ranges, or patterns.
 5. Built-in argument validation is implemented by tool handlers, not a general JSON Schema validator.
 6. The package-level generated call counter is mutable process-global state and is not synchronized. A port should use UUIDs, atomic counters, or request-local ID generation.
 7. Name allowlisting prevents undeclared call names, but does not prove argument safety or authorization.
@@ -1129,51 +1750,27 @@ A correct port should preserve these invariants:
 
 ## Function and file reference
 
-| Symbol or area                                      | Reference                                |
-|-----------------------------------------------------|------------------------------------------|
-| `ToolDef`, `ToolCall`, name and history formatters  | `pkg/toolcalling/toolcalling.go::19`     |
-| OpenAI prompt                                       | `pkg/toolcalling/simulated.go::21`       |
-| Anthropic prompt                                    | `pkg/toolcalling/simulated.go::62`       |
-| OpenAI parser, `ParseSimulatedResponse`             | `pkg/toolcalling/simulated.go::110`      |
-| Anthropic parser, `ParseSimulatedResponseAnthropic` | `pkg/toolcalling/simulated.go::161`      |
-| Anthropic payload extraction                        | `pkg/toolcalling/simulated.go::202`      |
-| OpenAI payload extraction                           | `pkg/toolcalling/simulated.go::321`      |
-| Argument normalization                              | `pkg/toolcalling/simulated.go::408`      |
-| OpenAI candidate scoring                            | `pkg/toolcalling/simulated.go::461`      |
-| Request-echo detection                              | `pkg/toolcalling/simulated.go::506`      |
-| JSON candidate enumeration                          | `pkg/toolcalling/simulated.go::532`      |
-| Built-in manager initialization                     | `pkg/servers/api.go::150`                |
-| Built-in schema preparation, `prepareCodingTools`   | `pkg/servers/api.go::557`                |
-| Local multi-round loop                              | `pkg/servers/api.go::606`                |
-| Chat Completions handler                            | `pkg/servers/api.go::679`                |
-| Completions handler                                 | `pkg/servers/api.go::782`                |
-| Anthropic Messages handler                          | `pkg/servers/api.go::920`                |
-| OpenAI chat streaming                               | `pkg/servers/api.go::1217`               |
-| OpenAI chat non-streaming                           | `pkg/servers/api.go::1439`               |
-| Anthropic Messages streaming                        | `pkg/servers/api.go::1551`               |
-| Anthropic Messages non-streaming                    | `pkg/servers/api.go::1839`               |
-| OpenAI Completions streaming                        | `pkg/servers/api.go::1943`               |
-| OpenAI Completions non-streaming                    | `pkg/servers/api.go::2107`               |
-| Prompt injection helpers                            | `pkg/servers/api.go::2366`               |
-| Tool-choice normalization                           | `pkg/servers/api.go::2399`               |
-| Responses request and handler                       | `pkg/servers/api.go::2527`               |
-| Responses input conversion                          | `pkg/servers/api.go::2639`               |
-| Responses output construction                       | `pkg/servers/api.go::2742`               |
-| M365 transport call types                           | `pkg/client/client.go::45`               |
-| Request-local stream result                         | `pkg/client/client.go::248`              |
-| SignalR extraction loop                             | `pkg/client/client.go::295`              |
-| M365 message tool extraction                        | `pkg/client/client.go::552`              |
-| Tool history decoding                               | `pkg/payload/payload.go::115`            |
-| M365 option-set filtering                           | `pkg/payload/payload.go::552`            |
-| M365 tool-message map                               | `pkg/models/models.go::93`               |
-| Local-tool environment config                       | `pkg/models/models.go::101`              |
-| Built-in schemas and dispatch                       | `pkg/codingtools/codingtools.go::77`     |
-| Path resolution and policy                          | `pkg/codingtools/codingtools.go::159`    |
-| File operations                                     | `pkg/codingtools/codingtools.go::221`    |
-| Patch validation                                    | `pkg/codingtools/codingtools.go::355`    |
-| Command execution and bounds                        | `pkg/codingtools/codingtools.go::386`    |
-| Unix process-tree handling                          | `pkg/codingtools/process_unix.go::12`    |
-| Windows process-tree handling                       | `pkg/codingtools/process_windows.go::11` |
-| OpenAI protocol script                              | `test_toolcalling_openai.sh::1`          |
-| Anthropic protocol script                           | `test_toolcalling_anthropic.sh::1`       |
-| Runtime image packages                              | `Dockerfile::16`                         |
+| Symbol or area                            | Reference                                                                                                                                                                 |
+|-------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Shared definitions and formatters         | the shared tool model, `ToolCall`, `ToolName`, `FormatToolResult`, `FormatAssistantToolCall`                                                                              |
+| Provider prompts                          | `the simulation engine`, `BuildSimulatedPrompt`, `BuildSimulatedPromptResponses`, `BuildSimulatedPromptAnthropic`                                                         |
+| Parsers                                   | `the simulation engine`, `ParseSimulatedResponse`, `ParseSimulatedResponseResponses`, `ParseSimulatedResponseAnthropic`                                                   |
+| Candidate extraction and scoring          | `the simulation engine`, `enumerateJSONCandidates`, `extractBalancedJSONSegments`, `scoreSimulatedCandidate`, `scoreAnthropicCandidate`, `isRequestLikeSimulatedPayload`  |
+| Arguments and repair                      | `the simulation engine`, `RequiredArgsByTool`, `requiredFromSchema`, `toolCallSatisfiesRequired`, `BuildRepairNote`                                                       |
+| API server initialization and preparation | `NewAPIServer`, `prepareCodingTools`, `replaceRequestTools`                                                                                                               |
+| Local loop and corrective retry           | `runToolLoop`, `repairSimulatedToolCalls`                                                                                                                                 |
+| Provider handlers                         | `handleChatCompletions`, `handleCompletions`, `handleAnthropicMessages`, `handleResponses`                                                                                |
+| Provider streaming and buffered output    | `streamChatCompletions`, `streamCompletions`, `streamAnthropicMessages`, `streamResponses`, `respondBufferedChat`, `respondBufferedAnthropic`, `respondBufferedResponses` |
+| Responses policy and dynamic tools        | `newResponsesToolPolicy`, `mergeLoadedResponsesTools`, `responsesToolDefsFromRawNamespace`, `resolveResponsesToolNamespace`, `buildResponsesToolCallItem`                 |
+| Responses conversion, retry, and output   | `responsesInputToMessages`, `parseResponsesSimulationWithRetry`, `responsesConversationWithEmptyRetry`, `responsesStreamWithEmptyRetry`, `buildResponsesObject`           |
+| SignalR call types and stream state       | `the transport layer`, `ToolCall`, `ToolCallFunction`, `StreamChunk`, `ChatConversationContext`, `ChatConversationStreamGenContext`                                       |
+| Backend call extraction                   | `the transport layer`, `extractToolCall`, `makeSearchToolCall`, and the SignalR receive loop                                                                              |
+| Tool history decoding and M365 payload    | `the payload builder`, `Message.UnmarshalJSON`, `conversationTextForM365`, `BuildPayload`, `BuildConversationPayload`                                                     |
+| M365 option-set filtering                 | `the payload builder`, `getOptions`, `codeInterpreterOptions`                                                                                                             |
+| Backend mapping and configuration         | `the model/configuration layer`, `ToolMessageType`, `Config`, `LoadConfig`                                                                                                |
+| Built-in schemas and dispatch             | `the local tool manager`, `Manager.Tools`, `Manager.Execute`                                                                                                              |
+| Workspace policy and file operations      | `the local tool manager`, `Manager.resolve`, `protected`, `listFiles`, `readFile`, `writeFile`, `searchFiles`, `applyPatch`                                               |
+| Command execution and bounds              | `the local tool manager`, `command`, `limitedBuffer`, `MarshalResult`                                                                                                     |
+| Process-tree handling                     | `the Unix process adapter` and `the Windows process adapter`                                                                                                              |
+| Protocol probes                           | Provider-specific integration probes                                                                                                                                      |
+| Runtime dependencies                      | The deployment image definition                                                                                                                                           |
