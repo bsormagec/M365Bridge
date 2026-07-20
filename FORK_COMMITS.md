@@ -45,6 +45,7 @@ Bu commitlerdeki **işlevsel mantık büyük ölçüde zaten repoda mevcut**.
 | `bd0f69d` | fix(api): improve tool handling and message formatting | api.go | Mantık önceki merge'de alındı |
 | `f6f45fa` | Improve required tool retry reliability | api.go, api_responses_test.go | Mantık önceki merge'de alındı |
 | `162452c` | chore: bump version to 1.3.1 | models.go | Versiyon farklı (1.3.7'ye geçildi) |
+| `89befd8` | chore: bump version to 1.3.7 | CHANGELOG.md, models.go | Sadece versiyon bump — işlevsel değişiklik yok, alınması şart değil |
 | `4de5992` | refactor: modernize code for gopls modernize analyzer | api.go, api_responses_test.go, streamextract.go | Revert edildi (api.go uyumsuz) |
 | `77ea9c7` | ci: add modernize job running gopls modernize analyzer | ci.yml | CI'da yok — gerekirse manuel eklenebilir |
 | `a5ca5c0` | ci: harden supply chain against integrity failures | ci.yml, release.yml, Dockerfile | Güvenlik — gerekirse manuel eklenebilir |
